@@ -1,0 +1,549 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+import { LogOut, Search, Plus, Package, ArrowDownToLine, ArrowUpFromLine, ClipboardList, LayoutDashboard, ScanLine, RefreshCw, AlertCircle, CheckCircle2 } from "lucide-react";
+
+const SUPABASE_URL = "https://zaakpcdkxdvpfribryvt.supabase.co";
+const ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InphYWtwY2RreGR2cGZyaWJyeXZ0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgxODMxMTIsImV4cCI6MjEwMzc1OTExMn0.vwxS6XgPwAu_IhnMeiF_a7XaLhsR5md_qM4jAKMIMxY";
+
+function useSupabase(accessToken) {
+  const rest = useCallback(async (path, opts = {}) => {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+      ...opts,
+      headers: {
+        apikey: ANON_KEY,
+        Authorization: `Bearer ${accessToken || ANON_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: opts.prefer || "return=representation",
+        ...(opts.headers || {}),
+      },
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || `Request failed (${res.status})`);
+    }
+    const text = await res.text();
+    return text ? JSON.parse(text) : null;
+  }, [accessToken]);
+
+  const rpc = useCallback(async (fn, params) => {
+    return rest(`rpc/${fn}`, { method: "POST", body: JSON.stringify(params) });
+  }, [rest]);
+
+  return { rest, rpc };
+}
+
+function Banner({ error, success, onClear }) {
+  if (!error && !success) return null;
+  return (
+    <div className={`flex items-start gap-2 rounded-md px-3 py-2 text-sm mb-4 ${error ? "bg-red-50 text-red-800 border border-red-200" : "bg-emerald-50 text-emerald-800 border border-emerald-200"}`}>
+      {error ? <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" /> : <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />}
+      <span className="flex-1">{error || success}</span>
+      <button onClick={onClear} className="text-xs opacity-60 hover:opacity-100">dismiss</button>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <label className="block mb-3">
+      <span className="block text-xs font-medium text-slate-500 mb-1">{label}</span>
+      {children}
+    </label>
+  );
+}
+
+const inputCls = "w-full border border-slate-300 rounded-md px-3 py-2 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600 focus:border-blue-600";
+const btnPrimary = "bg-blue-700 hover:bg-blue-800 text-white text-sm font-medium px-4 py-2 rounded-md disabled:opacity-50 disabled:cursor-not-allowed";
+const btnSecondary = "bg-white hover:bg-slate-50 text-slate-700 text-sm font-medium px-4 py-2 rounded-md border border-slate-300 disabled:opacity-50";
+const card = "bg-white border border-slate-200 rounded-lg p-5";
+
+function LoginScreen({ onLogin }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!email || !password) { setError("Enter email and password."); return; }
+    setBusy(true); setError("");
+    try {
+      const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+        method: "POST",
+        headers: { apikey: ANON_KEY, "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error_description || data.msg || "Login failed.");
+      onLogin(data);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="min-h-[520px] flex items-center justify-center bg-slate-100">
+      <form onSubmit={submit} className="bg-white border border-slate-200 rounded-lg p-8 w-80">
+        <div className="flex items-center gap-2 mb-6">
+          <Package className="w-5 h-5 text-blue-700" />
+          <h1 className="text-lg font-semibold text-slate-900">Warehouse inventory</h1>
+        </div>
+        <Banner error={error} onClear={() => setError("")} />
+        <Field label="Email">
+          <input className={inputCls} type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@warehouse.com" />
+        </Field>
+        <Field label="Password">
+          <input className={inputCls} type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" />
+        </Field>
+        <button type="submit" disabled={busy} className={`${btnPrimary} w-full mt-2`}>
+          {busy ? "Signing in..." : "Sign in"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function SkuSearchInput({ rest, value, onChange, onSelect, placeholder }) {
+  const [results, setResults] = useState([]);
+  const [open, setOpen] = useState(false);
+  const timer = useRef(null);
+
+  const handleChange = (v) => {
+    onChange(v);
+    clearTimeout(timer.current);
+    if (!v || v.length < 2) { setResults([]); return; }
+    timer.current = setTimeout(async () => {
+      try {
+        const rows = await rest(`skus?select=sku_code,style_code,category,color,size&sku_code=ilike.*${encodeURIComponent(v)}*&limit=15`);
+        setResults(rows || []);
+        setOpen(true);
+      } catch { /* ignore search errors while typing */ }
+    }, 250);
+  };
+
+  return (
+    <div className="relative">
+      <input
+        className={inputCls}
+        value={value}
+        placeholder={placeholder || "Type or scan SKU code"}
+        onChange={(e) => handleChange(e.target.value)}
+        onFocus={() => results.length && setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+      />
+      {open && results.length > 0 && (
+        <div className="absolute z-10 mt-1 w-full bg-white border border-slate-200 rounded-md shadow-md max-h-56 overflow-auto">
+          {results.map((r) => (
+            <button
+              type="button"
+              key={r.sku_code}
+              className="w-full text-left px-3 py-2 text-sm hover:bg-slate-50 border-b border-slate-100 last:border-0"
+              onMouseDown={() => { onSelect(r); setOpen(false); }}
+            >
+              <span className="font-medium text-slate-900">{r.sku_code}</span>
+              <span className="text-slate-500 ml-2">{[r.style_code, r.color, r.size].filter(Boolean).join(" / ")}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Dashboard({ rest }) {
+  const [query, setQuery] = useState("");
+  const [sku, setSku] = useState(null);
+  const [stock, setStock] = useState([]);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+  const [showAdd, setShowAdd] = useState(false);
+  const [newSku, setNewSku] = useState({ sku_code: "", style_code: "", category: "", color: "", size: "", description: "" });
+
+  const loadStock = async (skuRow) => {
+    setSku(skuRow);
+    setError("");
+    try {
+      const rows = await rest(`sku_stock?select=location_code,quantity&sku_code=eq.${encodeURIComponent(skuRow.sku_code)}&order=quantity.desc`);
+      setStock(rows || []);
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  const addSku = async (e) => {
+    e.preventDefault();
+    if (!newSku.sku_code) { setError("SKU code is required."); return; }
+    setError(""); setSuccess("");
+    try {
+      await rest("skus", { method: "POST", body: JSON.stringify(newSku) });
+      setSuccess(`SKU ${newSku.sku_code} added to master list.`);
+      setNewSku({ sku_code: "", style_code: "", category: "", color: "", size: "", description: "" });
+      setShowAdd(false);
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  const totalQty = stock.reduce((s, r) => s + r.quantity, 0);
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-base font-semibold text-slate-900">SKU lookup</h2>
+        <button onClick={() => setShowAdd((v) => !v)} className={btnSecondary}>
+          <Plus className="w-4 h-4 inline -mt-0.5 mr-1" /> Add SKU
+        </button>
+      </div>
+
+      <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
+
+      {showAdd && (
+        <form onSubmit={addSku} className={`${card} mb-5 grid grid-cols-2 gap-x-4`}>
+          <Field label="SKU code"><input className={inputCls} value={newSku.sku_code} onChange={(e) => setNewSku({ ...newSku, sku_code: e.target.value })} /></Field>
+          <Field label="Style code"><input className={inputCls} value={newSku.style_code} onChange={(e) => setNewSku({ ...newSku, style_code: e.target.value })} /></Field>
+          <Field label="Category"><input className={inputCls} value={newSku.category} onChange={(e) => setNewSku({ ...newSku, category: e.target.value })} /></Field>
+          <Field label="Color"><input className={inputCls} value={newSku.color} onChange={(e) => setNewSku({ ...newSku, color: e.target.value })} /></Field>
+          <Field label="Size"><input className={inputCls} value={newSku.size} onChange={(e) => setNewSku({ ...newSku, size: e.target.value })} /></Field>
+          <Field label="Description"><input className={inputCls} value={newSku.description} onChange={(e) => setNewSku({ ...newSku, description: e.target.value })} /></Field>
+          <div className="col-span-2"><button type="submit" className={btnPrimary}>Save SKU</button></div>
+        </form>
+      )}
+
+      <div className={`${card} mb-5`}>
+        <Field label="Search SKU code, style, color or size">
+          <SkuSearchInput rest={rest} value={query} onChange={setQuery} onSelect={(r) => { setQuery(r.sku_code); loadStock(r); }} />
+        </Field>
+      </div>
+
+      {sku && (
+        <div className={card}>
+          <div className="flex items-baseline justify-between mb-3">
+            <div>
+              <div className="text-lg font-semibold text-slate-900">{sku.sku_code}</div>
+              <div className="text-sm text-slate-500">{[sku.style_code, sku.category, sku.color, sku.size].filter(Boolean).join(" · ")}</div>
+            </div>
+            <div className="text-right">
+              <div className="text-xs text-slate-500">Total stock</div>
+              <div className="text-2xl font-semibold text-slate-900">{totalQty}</div>
+            </div>
+          </div>
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-slate-500 border-b border-slate-200">
+                <th className="py-1.5 font-medium">Location</th>
+                <th className="py-1.5 font-medium text-right">Quantity</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stock.length === 0 && (
+                <tr><td colSpan={2} className="py-3 text-slate-400">No stock recorded for this SKU yet.</td></tr>
+              )}
+              {stock.map((r) => (
+                <tr key={r.location_code} className="border-b border-slate-100 last:border-0">
+                  <td className="py-1.5 font-mono text-slate-800">{r.location_code}</td>
+                  <td className="py-1.5 text-right text-slate-900">{r.quantity}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Replenishment({ rest, rpc }) {
+  const [tab, setTab] = useState("new");
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+
+  const [stores, setStores] = useState([]);
+  const [reqForm, setReqForm] = useState({ sku_code: "", store_id: "", qty_requested: "" });
+
+  const [openRequests, setOpenRequests] = useState([]);
+  const [selectedReq, setSelectedReq] = useState(null);
+  const [pickLocations, setPickLocations] = useState([]);
+  const [pickForm, setPickForm] = useState({ source_location: "", qty_picked: "", qty_packed: "", party_name: "" });
+
+  const [verifyForm, setVerifyForm] = useState({ sku_code_requested: "", qty_requested: "", sku_code_scanned: "", qty_scanned: "" });
+
+  useEffect(() => {
+    rest("stores?select=id,name&order=name").then(setStores).catch((e) => setError(e.message));
+  }, [rest]);
+
+  const loadOpenRequests = useCallback(async () => {
+    try {
+      const rows = await rest("replenishment_requests?select=id,sku_code,qty_requested,status,stores(name)&status=eq.open&order=created_at.desc&limit=50");
+      setOpenRequests(rows || []);
+    } catch (err) { setError(err.message); }
+  }, [rest]);
+
+  useEffect(() => { if (tab === "pick") loadOpenRequests(); }, [tab, loadOpenRequests]);
+
+  const submitRequest = async (e) => {
+    e.preventDefault();
+    if (!reqForm.sku_code || !reqForm.store_id || !reqForm.qty_requested) { setError("All fields are required."); return; }
+    setError(""); setSuccess("");
+    try {
+      await rest("replenishment_requests", {
+        method: "POST",
+        body: JSON.stringify({ sku_code: reqForm.sku_code, store_id: Number(reqForm.store_id), qty_requested: Number(reqForm.qty_requested) }),
+      });
+      setSuccess(`Replenishment request created for ${reqForm.sku_code}.`);
+      setReqForm({ sku_code: "", store_id: "", qty_requested: "" });
+    } catch (err) { setError(err.message); }
+  };
+
+  const selectRequest = async (r) => {
+    setSelectedReq(r);
+    setError("");
+    try {
+      const rows = await rpc("get_pick_locations", { p_sku: r.sku_code, p_qty: r.qty_requested });
+      setPickLocations(rows || []);
+    } catch (err) { setError(err.message); }
+  };
+
+  const submitPick = async (e) => {
+    e.preventDefault();
+    if (!selectedReq) return;
+    if (!pickForm.source_location || !pickForm.qty_picked) { setError("Pick location and quantity are required."); return; }
+    setError(""); setSuccess("");
+    try {
+      await rest("replenishment_transactions", {
+        method: "POST",
+        body: JSON.stringify({
+          request_id: selectedReq.id,
+          sku_code: selectedReq.sku_code,
+          source_location: pickForm.source_location,
+          qty_picked: Number(pickForm.qty_picked),
+          qty_packed: Number(pickForm.qty_packed || pickForm.qty_picked),
+          party_name: pickForm.party_name,
+        }),
+      });
+      await rest(`replenishment_requests?id=eq.${selectedReq.id}`, { method: "PATCH", body: JSON.stringify({ status: "issued" }) });
+      setSuccess(`Picked ${pickForm.qty_picked} of ${selectedReq.sku_code} from ${pickForm.source_location}. Stock updated.`);
+      setSelectedReq(null); setPickLocations([]); setPickForm({ source_location: "", qty_picked: "", qty_packed: "", party_name: "" });
+      loadOpenRequests();
+    } catch (err) { setError(err.message); }
+  };
+
+  const submitVerify = async (e) => {
+    e.preventDefault();
+    if (!verifyForm.sku_code_requested) { setError("Enter the SKU that was on the pick list."); return; }
+    setError(""); setSuccess("");
+    try {
+      await rest("replenishment_list_items", {
+        method: "POST",
+        body: JSON.stringify({
+          sku_code_requested: verifyForm.sku_code_requested,
+          qty_requested: Number(verifyForm.qty_requested || 0),
+          sku_code_scanned: verifyForm.sku_code_scanned || verifyForm.sku_code_requested,
+          qty_scanned: Number(verifyForm.qty_scanned || 0),
+        }),
+      });
+      const diff = Number(verifyForm.qty_scanned || 0) - Number(verifyForm.qty_requested || 0);
+      setSuccess(diff === 0 ? "Match confirmed, no variance." : `Logged with a variance of ${diff}.`);
+      setVerifyForm({ sku_code_requested: "", qty_requested: "", sku_code_scanned: "", qty_scanned: "" });
+    } catch (err) { setError(err.message); }
+  };
+
+  const tabBtn = (id, label) => (
+    <button onClick={() => { setTab(id); setError(""); setSuccess(""); }} className={`px-3 py-1.5 text-sm rounded-md font-medium ${tab === id ? "bg-blue-700 text-white" : "text-slate-600 hover:bg-slate-100"}`}>
+      {label}
+    </button>
+  );
+
+  return (
+    <div>
+      <div className="flex gap-1 mb-4">
+        {tabBtn("new", "New request")}
+        {tabBtn("pick", "Pick list")}
+        {tabBtn("verify", "Verify scan")}
+      </div>
+
+      <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
+
+      {tab === "new" && (
+        <form onSubmit={submitRequest} className={`${card} max-w-md`}>
+          <Field label="SKU code"><SkuSearchInput rest={rest} value={reqForm.sku_code} onChange={(v) => setReqForm({ ...reqForm, sku_code: v })} onSelect={(r) => setReqForm({ ...reqForm, sku_code: r.sku_code })} /></Field>
+          <Field label="Destination store">
+            <select className={inputCls} value={reqForm.store_id} onChange={(e) => setReqForm({ ...reqForm, store_id: e.target.value })}>
+              <option value="">Select a store</option>
+              {stores.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+          </Field>
+          <Field label="Quantity requested"><input className={inputCls} type="number" min="1" value={reqForm.qty_requested} onChange={(e) => setReqForm({ ...reqForm, qty_requested: e.target.value })} /></Field>
+          <button className={btnPrimary} type="submit">Create request</button>
+        </form>
+      )}
+
+      {tab === "pick" && (
+        <div className="grid grid-cols-2 gap-5">
+          <div className={card}>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold text-slate-900">Open requests</h3>
+              <button onClick={loadOpenRequests} className="text-slate-400 hover:text-slate-700"><RefreshCw className="w-4 h-4" /></button>
+            </div>
+            <div className="space-y-1 max-h-96 overflow-auto">
+              {openRequests.length === 0 && <div className="text-sm text-slate-400">No open requests.</div>}
+              {openRequests.map((r) => (
+                <button key={r.id} onClick={() => selectRequest(r)} className={`w-full text-left px-3 py-2 rounded-md text-sm border ${selectedReq?.id === r.id ? "border-blue-600 bg-blue-50" : "border-slate-200 hover:bg-slate-50"}`}>
+                  <div className="font-medium text-slate-900">{r.sku_code} &middot; {r.qty_requested} units</div>
+                  <div className="text-xs text-slate-500">{r.stores?.name}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className={card}>
+            <h3 className="text-sm font-semibold text-slate-900 mb-3">Pick locations {selectedReq ? `for ${selectedReq.sku_code}` : ""}</h3>
+            {!selectedReq && <div className="text-sm text-slate-400">Select a request to see live pick locations.</div>}
+            {selectedReq && (
+              <>
+                <table className="w-full text-sm mb-4">
+                  <thead><tr className="text-left text-slate-500 border-b border-slate-200"><th className="py-1 font-medium">Location</th><th className="py-1 font-medium text-right">Available now</th></tr></thead>
+                  <tbody>
+                    {pickLocations.length === 0 && <tr><td colSpan={2} className="py-2 text-red-600">No stock currently available anywhere.</td></tr>}
+                    {pickLocations.map((l) => (
+                      <tr key={l.location_code} className="border-b border-slate-100 last:border-0">
+                        <td className="py-1 font-mono">{l.location_code}</td>
+                        <td className="py-1 text-right">{l.available_qty}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <form onSubmit={submitPick}>
+                  <Field label="Pick from location">
+                    <select className={inputCls} value={pickForm.source_location} onChange={(e) => setPickForm({ ...pickForm, source_location: e.target.value })}>
+                      <option value="">Select location</option>
+                      {pickLocations.map((l) => <option key={l.location_code} value={l.location_code}>{l.location_code} ({l.available_qty} available)</option>)}
+                    </select>
+                  </Field>
+                  <div className="grid grid-cols-2 gap-3">
+                    <Field label="Qty picked"><input className={inputCls} type="number" min="1" value={pickForm.qty_picked} onChange={(e) => setPickForm({ ...pickForm, qty_picked: e.target.value })} /></Field>
+                    <Field label="Qty packed"><input className={inputCls} type="number" min="0" value={pickForm.qty_packed} onChange={(e) => setPickForm({ ...pickForm, qty_packed: e.target.value })} /></Field>
+                  </div>
+                  <Field label="Picked/packed by"><input className={inputCls} value={pickForm.party_name} onChange={(e) => setPickForm({ ...pickForm, party_name: e.target.value })} /></Field>
+                  <button className={btnPrimary} type="submit">Log pick and dispatch</button>
+                </form>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {tab === "verify" && (
+        <form onSubmit={submitVerify} className={`${card} max-w-md`}>
+          <p className="text-xs text-slate-500 mb-3">Scan or type what the pick list said, then what was actually scanned off the shelf.</p>
+          <Field label="SKU on pick list"><input className={inputCls} value={verifyForm.sku_code_requested} onChange={(e) => setVerifyForm({ ...verifyForm, sku_code_requested: e.target.value })} /></Field>
+          <Field label="Quantity on pick list"><input className={inputCls} type="number" value={verifyForm.qty_requested} onChange={(e) => setVerifyForm({ ...verifyForm, qty_requested: e.target.value })} /></Field>
+          <Field label="SKU scanned"><input className={inputCls} value={verifyForm.sku_code_scanned} onChange={(e) => setVerifyForm({ ...verifyForm, sku_code_scanned: e.target.value })} /></Field>
+          <Field label="Quantity scanned"><input className={inputCls} type="number" value={verifyForm.qty_scanned} onChange={(e) => setVerifyForm({ ...verifyForm, qty_scanned: e.target.value })} /></Field>
+          <button className={btnPrimary} type="submit">Log verification</button>
+        </form>
+      )}
+    </div>
+  );
+}
+
+function Inbound({ rest }) {
+  const [form, setForm] = useState({ sku_code: "", txn_type: "purchase", party_name: "", qty_picked: "", qty_packed: "", qty_put_away: "", destination_location: "" });
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!form.sku_code || !form.destination_location || !form.qty_put_away) {
+      setError("SKU code, destination location, and quantity put away are required.");
+      return;
+    }
+    setError(""); setSuccess("");
+    try {
+      await rest("inbound_transactions", {
+        method: "POST",
+        body: JSON.stringify({
+          sku_code: form.sku_code,
+          txn_type: form.txn_type,
+          party_name: form.party_name,
+          qty_picked: Number(form.qty_picked || form.qty_put_away),
+          qty_packed: Number(form.qty_packed || form.qty_put_away),
+          qty_put_away: Number(form.qty_put_away),
+          destination_location: form.destination_location,
+        }),
+      });
+      setSuccess(`Put away ${form.qty_put_away} of ${form.sku_code} at ${form.destination_location}. Stock updated.`);
+      setForm({ sku_code: "", txn_type: "purchase", party_name: "", qty_picked: "", qty_packed: "", qty_put_away: "", destination_location: "" });
+    } catch (err) {
+      setError(err.message.includes("foreign key") ? "That SKU isn't in the master list yet. Add it from the Dashboard tab first." : err.message);
+    }
+  };
+
+  return (
+    <div>
+      <h2 className="text-base font-semibold text-slate-900 mb-4">Log inbound receipt</h2>
+      <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
+      <form onSubmit={submit} className={`${card} max-w-md`}>
+        <Field label="SKU code"><SkuSearchInput rest={rest} value={form.sku_code} onChange={(v) => setForm({ ...form, sku_code: v })} onSelect={(r) => setForm({ ...form, sku_code: r.sku_code })} /></Field>
+        <Field label="Transaction type">
+          <select className={inputCls} value={form.txn_type} onChange={(e) => setForm({ ...form, txn_type: e.target.value })}>
+            <option value="purchase">Purchase</option>
+            <option value="returns">Returns</option>
+            <option value="retrieval">Retrieval</option>
+          </select>
+        </Field>
+        <Field label="Customer / vendor name"><input className={inputCls} value={form.party_name} onChange={(e) => setForm({ ...form, party_name: e.target.value })} /></Field>
+        <div className="grid grid-cols-3 gap-3">
+          <Field label="Picked"><input className={inputCls} type="number" min="0" value={form.qty_picked} onChange={(e) => setForm({ ...form, qty_picked: e.target.value })} /></Field>
+          <Field label="Packed"><input className={inputCls} type="number" min="0" value={form.qty_packed} onChange={(e) => setForm({ ...form, qty_packed: e.target.value })} /></Field>
+          <Field label="Put away"><input className={inputCls} type="number" min="0" value={form.qty_put_away} onChange={(e) => setForm({ ...form, qty_put_away: e.target.value })} /></Field>
+        </div>
+        <Field label="Put-away location"><input className={inputCls} value={form.destination_location} onChange={(e) => setForm({ ...form, destination_location: e.target.value })} placeholder="e.g. A-12-03" /></Field>
+        <button className={btnPrimary} type="submit">Log inbound</button>
+      </form>
+    </div>
+  );
+}
+
+export default function App() {
+  const [session, setSession] = useState(null);
+  const { rest, rpc } = useSupabase(session?.access_token);
+  const [page, setPage] = useState("dashboard");
+
+  if (!session) return <LoginScreen onLogin={setSession} />;
+
+  const nav = [
+    { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+    { id: "replenishment", label: "Replenishment", icon: ClipboardList },
+    { id: "inbound", label: "Inbound", icon: ArrowDownToLine },
+  ];
+
+  return (
+    <div className="min-h-[600px] bg-slate-50 flex">
+      <div className="w-52 bg-white border-r border-slate-200 flex flex-col shrink-0">
+        <div className="flex items-center gap-2 px-4 py-4 border-b border-slate-200">
+          <Package className="w-5 h-5 text-blue-700" />
+          <span className="font-semibold text-slate-900 text-sm">Inventory</span>
+        </div>
+        <nav className="flex-1 p-2 space-y-1">
+          {nav.map((n) => (
+            <button key={n.id} onClick={() => setPage(n.id)} className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium ${page === n.id ? "bg-blue-50 text-blue-700" : "text-slate-600 hover:bg-slate-50"}`}>
+              <n.icon className="w-4 h-4" /> {n.label}
+            </button>
+          ))}
+        </nav>
+        <div className="p-3 border-t border-slate-200">
+          <div className="text-xs text-slate-500 truncate mb-2">{session.user?.email}</div>
+          <button onClick={() => setSession(null)} className="w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm text-slate-600 hover:bg-slate-50">
+            <LogOut className="w-4 h-4" /> Sign out
+          </button>
+        </div>
+      </div>
+      <div className="flex-1 p-6 overflow-auto">
+        {page === "dashboard" && <Dashboard rest={rest} />}
+        {page === "replenishment" && <Replenishment rest={rest} rpc={rpc} />}
+        {page === "inbound" && <Inbound rest={rest} />}
+      </div>
+    </div>
+  );
+}
