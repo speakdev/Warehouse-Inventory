@@ -254,6 +254,213 @@ function Dashboard({ rest }) {
   );
 }
 
+// Generic small-file (bulk request lists, inbound receipt lists) reader.
+// Unlike the SKU master importer, these don't need the COMBINED LOCATIONS
+// format — just a flat sheet with a handful of columns.
+function readSheetRows(file) {
+  return new Promise((resolve, reject) => {
+    file.arrayBuffer().then((buf) => {
+      try {
+        const wb = XLSX.read(buf, { type: "array" });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        resolve(XLSX.utils.sheet_to_json(sheet, { defval: null }));
+      } catch (err) { reject(err); }
+    }).catch(reject);
+  });
+}
+function findColumn(sampleRow, candidates) {
+  const keys = Object.keys(sampleRow || {});
+  for (const c of candidates) {
+    const hit = keys.find((k) => k.trim().toLowerCase() === c);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+async function bulkInsert(rest, table, records, batchSize, setProgress) {
+  for (let i = 0; i < records.length; i += batchSize) {
+    const batch = records.slice(i, i + batchSize);
+    await rest(table, { method: "POST", body: JSON.stringify(batch), prefer: "return=minimal" });
+    if (setProgress) setProgress({ done: Math.min(i + batchSize, records.length), total: records.length });
+  }
+}
+
+function BulkReplenishRequest({ rest, stores, onDone }) {
+  const [fileName, setFileName] = useState("");
+  const [parsed, setParsed] = useState([]);
+  const [unmatchedStore, setUnmatchedStore] = useState("");
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+  const [progress, setProgress] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const handleFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setError(""); setSuccess(""); setParsed([]); setUnmatchedStore("");
+    setFileName(file.name);
+    try {
+      const rows = await readSheetRows(file);
+      if (!rows.length) { setError("That file has no rows."); return; }
+      const skuKey = findColumn(rows[0], ["sku_code", "sku code", "sku"]);
+      const qtyKey = findColumn(rows[0], ["quantity", "qty", "qty_requested", "qty requested"]);
+      const storeKey = findColumn(rows[0], ["store", "store_name", "store name", "destination"]);
+      if (!skuKey || !qtyKey || !storeKey) {
+        setError("Expected columns for SKU code, quantity, and store. Found: " + Object.keys(rows[0]).join(", "));
+        return;
+      }
+      const storeByName = new Map(stores.map((s) => [s.name.trim().toLowerCase(), s.id]));
+      const out = [];
+      let firstUnmatched = "";
+      for (const row of rows) {
+        const sku = String(row[skuKey] ?? "").trim();
+        const qty = Number(row[qtyKey] ?? 0);
+        const storeName = String(row[storeKey] ?? "").trim();
+        if (!sku || !qty) continue;
+        const storeId = storeByName.get(storeName.toLowerCase());
+        if (!storeId) { if (!firstUnmatched) firstUnmatched = storeName; continue; }
+        out.push({ sku_code: sku, store_id: storeId, qty_requested: qty });
+      }
+      setUnmatchedStore(firstUnmatched);
+      setParsed(out);
+    } catch (err) {
+      setError("Couldn't read that file: " + err.message);
+    }
+  };
+
+  const runImport = async () => {
+    setBusy(true); setError(""); setSuccess("");
+    setProgress({ done: 0, total: parsed.length });
+    try {
+      await bulkInsert(rest, "replenishment_requests", parsed, 500, setProgress);
+      setSuccess(`Created ${parsed.length} replenishment requests.`);
+      setParsed([]); setFileName(""); setProgress(null);
+      onDone?.();
+    } catch (err) {
+      setError(err.message.includes("foreign key") ? "Some SKU codes in that file aren't in the master list yet — add them first (Dashboard or Bulk upload SKUs)." : err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className={`${card} max-w-lg`}>
+      <p className="text-xs text-slate-500 mb-3">
+        Upload a store's replenishment list (.xlsx or .csv) with columns for SKU code, quantity, and store name — every row becomes an open request, ready for pick lists.
+      </p>
+      <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
+      <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFile} className="text-sm mb-4" />
+      {unmatchedStore && <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-3 py-2 mb-3">Some rows use a store name that doesn't match your store list (e.g. "{unmatchedStore}") — those rows were skipped. Store names must match exactly: {stores.map((s) => s.name).join(", ")}.</div>}
+      {parsed.length > 0 && <div className="bg-slate-50 border border-slate-200 rounded-md px-3 py-2 text-sm mb-4">Found <strong>{parsed.length}</strong> valid request rows in {fileName}.</div>}
+      {progress && (
+        <div className="mb-4">
+          <div className="w-full bg-slate-200 rounded-full h-2 mb-1"><div className="bg-blue-700 h-2 rounded-full transition-all" style={{ width: `${(progress.done / progress.total) * 100}%` }} /></div>
+          <div className="text-xs text-slate-500">{progress.done} / {progress.total}</div>
+        </div>
+      )}
+      <button disabled={parsed.length === 0 || busy} onClick={runImport} className={btnPrimary}>{busy ? "Creating..." : `Create ${parsed.length || ""} requests`}</button>
+    </div>
+  );
+}
+
+function BulkInboundReceive({ rest }) {
+  const [meta, setMeta] = useState({ party_name: "", txn_type: "purchase", default_location: "" });
+  const [fileName, setFileName] = useState("");
+  const [parsed, setParsed] = useState([]);
+  const [missingLocationCount, setMissingLocationCount] = useState(0);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+  const [progress, setProgress] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const handleFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setError(""); setSuccess(""); setParsed([]);
+    setFileName(file.name);
+    try {
+      const rows = await readSheetRows(file);
+      if (!rows.length) { setError("That file has no rows."); return; }
+      const skuKey = findColumn(rows[0], ["sku_code", "sku code", "sku"]);
+      const qtyKey = findColumn(rows[0], ["quantity", "qty", "qty_put_away", "put away", "put_away"]);
+      const locKey = findColumn(rows[0], ["location", "location_code", "destination", "destination_location"]);
+      if (!skuKey || !qtyKey) {
+        setError("Expected columns for SKU code and quantity. Found: " + Object.keys(rows[0]).join(", "));
+        return;
+      }
+      let missing = 0;
+      const out = [];
+      for (const row of rows) {
+        const sku = String(row[skuKey] ?? "").trim();
+        const qty = Number(row[qtyKey] ?? 0);
+        const loc = locKey ? String(row[locKey] ?? "").trim() : "";
+        if (!sku || !qty) continue;
+        if (!loc) missing += 1;
+        out.push({ sku_code: sku, qty_put_away: qty, location: loc });
+      }
+      setMissingLocationCount(missing);
+      setParsed(out);
+    } catch (err) {
+      setError("Couldn't read that file: " + err.message);
+    }
+  };
+
+  const runImport = async () => {
+    if (missingLocationCount > 0 && !meta.default_location) {
+      setError(`${missingLocationCount} row(s) have no location in the file — set a default put-away location above, or add a location column to the file.`);
+      return;
+    }
+    if (!meta.party_name) { setError("Enter the supplier/vendor name for this shipment."); return; }
+    setBusy(true); setError(""); setSuccess("");
+    setProgress({ done: 0, total: parsed.length });
+    try {
+      const records = parsed.map((r) => ({
+        sku_code: r.sku_code,
+        txn_type: meta.txn_type,
+        party_name: meta.party_name,
+        qty_picked: r.qty_put_away,
+        qty_packed: r.qty_put_away,
+        qty_put_away: r.qty_put_away,
+        destination_location: r.location || meta.default_location,
+      }));
+      await bulkInsert(rest, "inbound_transactions", records, 500, setProgress);
+      setSuccess(`Logged inbound receipt for ${parsed.length} SKUs from ${meta.party_name}. Stock updated.`);
+      setParsed([]); setFileName(""); setProgress(null);
+    } catch (err) {
+      setError(err.message.includes("foreign key") ? "Some SKU codes in that file aren't in the master list yet — add them first (Dashboard or Bulk upload SKUs)." : err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className={`${card} max-w-lg`}>
+      <p className="text-xs text-slate-500 mb-3">
+        Upload a shipment's packing list (.xlsx or .csv) — e.g. 1,000 SKUs received from one supplier at once. Columns needed: SKU code and quantity; a location column is optional if everything goes to the same spot.
+      </p>
+      <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
+      <Field label="Supplier / vendor name"><input className={inputCls} value={meta.party_name} onChange={(e) => setMeta({ ...meta, party_name: e.target.value })} placeholder="e.g. Aramex" /></Field>
+      <Field label="Transaction type">
+        <select className={inputCls} value={meta.txn_type} onChange={(e) => setMeta({ ...meta, txn_type: e.target.value })}>
+          <option value="purchase">Purchase</option>
+          <option value="returns">Returns</option>
+          <option value="retrieval">Retrieval</option>
+        </select>
+      </Field>
+      <Field label="Default put-away location (used if the file has no location column, or a row is blank)"><input className={inputCls} value={meta.default_location} onChange={(e) => setMeta({ ...meta, default_location: e.target.value })} placeholder="e.g. RECEIVING-01" /></Field>
+      <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFile} className="text-sm mb-4" />
+      {parsed.length > 0 && <div className="bg-slate-50 border border-slate-200 rounded-md px-3 py-2 text-sm mb-4">Found <strong>{parsed.length}</strong> SKU rows in {fileName}{missingLocationCount > 0 ? ` (${missingLocationCount} with no location in the file — will use your default)` : ""}.</div>}
+      {progress && (
+        <div className="mb-4">
+          <div className="w-full bg-slate-200 rounded-full h-2 mb-1"><div className="bg-blue-700 h-2 rounded-full transition-all" style={{ width: `${(progress.done / progress.total) * 100}%` }} /></div>
+          <div className="text-xs text-slate-500">{progress.done} / {progress.total}</div>
+        </div>
+      )}
+      <button disabled={parsed.length === 0 || busy} onClick={runImport} className={btnPrimary}>{busy ? "Logging..." : `Log ${parsed.length || ""} inbound units`}</button>
+    </div>
+  );
+}
+
 function Replenishment({ rest, rpc }) {
   const [tab, setTab] = useState("new");
   const [error, setError] = useState("");
@@ -359,11 +566,14 @@ function Replenishment({ rest, rpc }) {
     <div>
       <div className="flex gap-1 mb-4">
         {tabBtn("new", "New request")}
+        {tabBtn("bulk", "Bulk request")}
         {tabBtn("pick", "Pick list")}
         {tabBtn("verify", "Verify scan")}
       </div>
 
       <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
+
+      {tab === "bulk" && <BulkReplenishRequest rest={rest} stores={stores} onDone={loadOpenRequests} />}
 
       {tab === "new" && (
         <form onSubmit={submitRequest} className={`${card} max-w-md`}>
@@ -449,6 +659,7 @@ function Replenishment({ rest, rpc }) {
 }
 
 function Inbound({ rest }) {
+  const [mode, setMode] = useState("single");
   const [form, setForm] = useState({ sku_code: "", txn_type: "purchase", party_name: "", qty_picked: "", qty_packed: "", qty_put_away: "", destination_location: "" });
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
@@ -480,9 +691,22 @@ function Inbound({ rest }) {
     }
   };
 
+  const tabBtn = (id, label) => (
+    <button onClick={() => setMode(id)} className={`px-3 py-1.5 text-sm rounded-md font-medium ${mode === id ? "bg-blue-700 text-white" : "text-slate-600 hover:bg-slate-100"}`}>
+      {label}
+    </button>
+  );
+
   return (
     <div>
       <h2 className="text-base font-semibold text-slate-900 mb-4">Log inbound receipt</h2>
+      <div className="flex gap-1 mb-4">
+        {tabBtn("single", "Single SKU")}
+        {tabBtn("bulk", "Bulk shipment")}
+      </div>
+      {mode === "bulk" && <BulkInboundReceive rest={rest} />}
+      {mode === "single" && (
+      <>
       <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
       <form onSubmit={submit} className={`${card} max-w-md`}>
         <Field label="SKU code"><SkuSearchInput rest={rest} value={form.sku_code} onChange={(v) => setForm({ ...form, sku_code: v })} onSelect={(r) => setForm({ ...form, sku_code: r.sku_code })} /></Field>
@@ -502,6 +726,8 @@ function Inbound({ rest }) {
         <Field label="Put-away location"><input className={inputCls} value={form.destination_location} onChange={(e) => setForm({ ...form, destination_location: e.target.value })} placeholder="e.g. A-12-03" /></Field>
         <button className={btnPrimary} type="submit">Log inbound</button>
       </form>
+      </>
+      )}
     </div>
   );
 }
@@ -744,35 +970,44 @@ function Summary({ rest, rpc }) {
 function parseInventoryRows(rows) {
   if (!rows.length) return [];
   const headerKeys = Object.keys(rows[0]).map((k) => k.trim().toUpperCase());
-  const out = []; // {sku_code, location_code, quantity}
+  // Aggregate globally across the WHOLE file, not just within one row —
+  // the same SKU can legitimately appear on multiple rows (or the same
+  // SKU+location combination can repeat), and Postgres refuses to update
+  // the same conflict target twice within a single batch insert.
+  const tally = new Map(); // key `${sku}|${location}` -> summed quantity
+
+  const bump = (sku, location, qty) => {
+    if (!sku || !location) return;
+    const key = `${sku}|${location}`;
+    tally.set(key, (tally.get(key) || 0) + qty);
+  };
 
   if (headerKeys.includes("SKU CODE") && headerKeys.includes("COMBINED LOCATIONS")) {
     for (const row of rows) {
       const sku = String(row["SKU CODE"] ?? "").trim();
       const combined = row["COMBINED LOCATIONS"];
       if (!sku || !combined) continue;
-      const tally = {};
-      String(combined).split(",").map((s) => s.trim()).filter(Boolean).forEach((loc) => {
-        tally[loc] = (tally[loc] || 0) + 1;
-      });
-      Object.entries(tally).forEach(([location_code, quantity]) => out.push({ sku_code: sku, location_code, quantity }));
+      String(combined).split(",").map((s) => s.trim()).filter(Boolean).forEach((loc) => bump(sku, loc, 1));
     }
-    return out;
+  } else {
+    // flat format - find columns case-insensitively
+    const findKey = (target) => Object.keys(rows[0]).find((k) => k.trim().toLowerCase() === target);
+    const skuKey = findKey("sku_code") || findKey("sku code");
+    const locKey = findKey("location_code") || findKey("location");
+    const qtyKey = findKey("quantity") || findKey("qty");
+    if (!skuKey || !locKey) return [];
+    for (const row of rows) {
+      const sku = String(row[skuKey] ?? "").trim();
+      const loc = String(row[locKey] ?? "").trim();
+      if (!sku || !loc) continue;
+      bump(sku, loc, Number(row[qtyKey] ?? 1) || 1);
+    }
   }
 
-  // flat format - find columns case-insensitively
-  const findKey = (target) => Object.keys(rows[0]).find((k) => k.trim().toLowerCase() === target);
-  const skuKey = findKey("sku_code") || findKey("sku code");
-  const locKey = findKey("location_code") || findKey("location");
-  const qtyKey = findKey("quantity") || findKey("qty");
-  if (!skuKey || !locKey) return [];
-  for (const row of rows) {
-    const sku = String(row[skuKey] ?? "").trim();
-    const loc = String(row[locKey] ?? "").trim();
-    if (!sku || !loc) continue;
-    out.push({ sku_code: sku, location_code: loc, quantity: Number(row[qtyKey] ?? 1) || 1 });
-  }
-  return out;
+  return [...tally.entries()].map(([key, quantity]) => {
+    const [sku_code, location_code] = key.split("|");
+    return { sku_code, location_code, quantity };
+  });
 }
 
 function BulkUpload({ rest }) {
