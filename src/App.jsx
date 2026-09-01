@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { LogOut, Search, Plus, Package, ArrowDownToLine, ArrowUpFromLine, ClipboardList, LayoutDashboard, ScanLine, RefreshCw, AlertCircle, CheckCircle2 } from "lucide-react";
+import { LogOut, Search, Plus, Package, ArrowDownToLine, ArrowUpFromLine, ClipboardList, LayoutDashboard, ScanLine, RefreshCw, AlertCircle, CheckCircle2, ListTree, UploadCloud, ClipboardCheck, ChevronLeft, ChevronRight } from "lucide-react";
+import * as XLSX from "xlsx";
 
 const SUPABASE_URL = "https://zaakpcdkxdvpfribryvt.supabase.co";
 const ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InphYWtwY2RreGR2cGZyaWJyeXZ0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgxODMxMTIsImV4cCI6MjEwMzc1OTExMn0.vwxS6XgPwAu_IhnMeiF_a7XaLhsR5md_qM4jAKMIMxY";
@@ -505,17 +506,394 @@ function Inbound({ rest }) {
   );
 }
 
+const PAGE_SIZE = 25;
+
+function Pager({ page, setPage, hasMore }) {
+  return (
+    <div className="flex items-center justify-between mt-3">
+      <button disabled={page === 0} onClick={() => setPage((p) => Math.max(0, p - 1))} className={`${btnSecondary} !py-1 !px-2`}>
+        <ChevronLeft className="w-4 h-4" />
+      </button>
+      <span className="text-xs text-slate-500">Page {page + 1}</span>
+      <button disabled={!hasMore} onClick={() => setPage((p) => p + 1)} className={`${btnSecondary} !py-1 !px-2`}>
+        <ChevronRight className="w-4 h-4" />
+      </button>
+    </div>
+  );
+}
+
+function StockOverview({ rest }) {
+  const [search, setSearch] = useState("");
+  const [rows, setRows] = useState([]);
+  const [page, setPage] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true); setError("");
+    try {
+      const from = page * PAGE_SIZE;
+      const to = from + PAGE_SIZE; // fetch one extra to know if there's a next page
+      const filter = search ? `&sku_code=ilike.*${encodeURIComponent(search)}*` : "";
+      const data = await rest(`sku_totals?select=sku_code,total_qty,location_breakdown&order=sku_code${filter}&limit=${PAGE_SIZE + 1}&offset=${from}`);
+      setHasMore((data || []).length > PAGE_SIZE);
+      setRows((data || []).slice(0, PAGE_SIZE));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [rest, page, search]);
+
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => { setPage(0); }, [search]);
+
+  return (
+    <div>
+      <h2 className="text-base font-semibold text-slate-900 mb-4">Stock on hand</h2>
+      <Banner error={error} onClear={() => setError("")} />
+      <div className={`${card} mb-4`}>
+        <Field label="Search SKU code">
+          <div className="relative">
+            <Search className="w-4 h-4 absolute left-3 top-2.5 text-slate-400" />
+            <input className={`${inputCls} pl-9`} value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Type a SKU code to filter" />
+          </div>
+        </Field>
+      </div>
+      <div className={card}>
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-slate-500 border-b border-slate-200">
+              <th className="py-1.5 font-medium">SKU code</th>
+              <th className="py-1.5 font-medium text-right">Total qty</th>
+              <th className="py-1.5 font-medium">Locations (code:qty)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading && <tr><td colSpan={3} className="py-3 text-slate-400">Loading...</td></tr>}
+            {!loading && rows.length === 0 && <tr><td colSpan={3} className="py-3 text-slate-400">No SKUs found.</td></tr>}
+            {rows.map((r) => (
+              <tr key={r.sku_code} className="border-b border-slate-100 last:border-0 align-top">
+                <td className="py-1.5 font-mono text-slate-800 whitespace-nowrap">{r.sku_code}</td>
+                <td className="py-1.5 text-right text-slate-900 whitespace-nowrap">{r.total_qty}</td>
+                <td className="py-1.5 text-slate-500 text-xs">{r.location_breakdown}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <Pager page={page} setPage={setPage} hasMore={hasMore} />
+      </div>
+    </div>
+  );
+}
+
+function Ledger({ rest }) {
+  const [skuFilter, setSkuFilter] = useState("");
+  const [rows, setRows] = useState([]);
+  const [page, setPage] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true); setError("");
+    try {
+      const from = page * PAGE_SIZE;
+      const filter = skuFilter ? `&sku_code=ilike.*${encodeURIComponent(skuFilter)}*` : "";
+      const data = await rest(`transaction_ledger?select=*&order=created_at.desc${filter}&limit=${PAGE_SIZE + 1}&offset=${from}`);
+      setHasMore((data || []).length > PAGE_SIZE);
+      setRows((data || []).slice(0, PAGE_SIZE));
+    } catch (err) {
+      setError(err.message.includes("relation") ? "Run schema_patch_2.sql in Supabase first to enable the ledger view." : err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [rest, page, skuFilter]);
+
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => { setPage(0); }, [skuFilter]);
+
+  return (
+    <div>
+      <h2 className="text-base font-semibold text-slate-900 mb-4">Transaction ledger</h2>
+      <Banner error={error} onClear={() => setError("")} />
+      <div className={`${card} mb-4`}>
+        <Field label="Filter by SKU code">
+          <input className={inputCls} value={skuFilter} onChange={(e) => setSkuFilter(e.target.value)} placeholder="Leave blank to see everything" />
+        </Field>
+      </div>
+      <div className={card}>
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-slate-500 border-b border-slate-200">
+              <th className="py-1.5 font-medium">Type</th>
+              <th className="py-1.5 font-medium">SKU</th>
+              <th className="py-1.5 font-medium">Date</th>
+              <th className="py-1.5 font-medium">Party</th>
+              <th className="py-1.5 font-medium">Location</th>
+              <th className="py-1.5 font-medium text-right">Qty</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading && <tr><td colSpan={6} className="py-3 text-slate-400">Loading...</td></tr>}
+            {!loading && rows.length === 0 && <tr><td colSpan={6} className="py-3 text-slate-400">No transactions yet.</td></tr>}
+            {rows.map((r) => (
+              <tr key={`${r.txn_kind}-${r.id}`} className="border-b border-slate-100 last:border-0">
+                <td className="py-1.5">
+                  <span className={`text-xs px-1.5 py-0.5 rounded ${r.txn_kind === "inbound" ? "bg-emerald-50 text-emerald-700" : "bg-blue-50 text-blue-700"}`}>{r.txn_kind}</span>
+                </td>
+                <td className="py-1.5 font-mono">{r.sku_code}</td>
+                <td className="py-1.5 text-slate-500 text-xs">{r.txn_date}</td>
+                <td className="py-1.5">{r.party_name}</td>
+                <td className="py-1.5 font-mono text-xs">{r.location}</td>
+                <td className="py-1.5 text-right">{r.quantity}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <Pager page={page} setPage={setPage} hasMore={hasMore} />
+      </div>
+    </div>
+  );
+}
+
+function Summary({ rest, rpc }) {
+  const [countForm, setCountForm] = useState({ sku_code: "", counted_qty: "" });
+  const [rows, setRows] = useState([]);
+  const [page, setPage] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+
+  const load = useCallback(async () => {
+    try {
+      const from = page * PAGE_SIZE;
+      const data = await rest(`stock_counts?select=sku_code,count_date,open_stock,close_stock,counted_qty,difference&order=count_date.desc&limit=${PAGE_SIZE + 1}&offset=${from}`);
+      setHasMore((data || []).length > PAGE_SIZE);
+      setRows((data || []).slice(0, PAGE_SIZE));
+    } catch (err) {
+      setError(err.message);
+    }
+  }, [rest, page]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const submitCount = async (e) => {
+    e.preventDefault();
+    if (!countForm.sku_code || countForm.counted_qty === "") { setError("SKU code and counted quantity are required."); return; }
+    setError(""); setSuccess("");
+    try {
+      await rpc("record_daily_count", { p_sku: countForm.sku_code, p_counted_qty: Number(countForm.counted_qty) });
+      setSuccess(`Count logged for ${countForm.sku_code}.`);
+      setCountForm({ sku_code: "", counted_qty: "" });
+      setPage(0);
+      load();
+    } catch (err) {
+      setError(err.message.includes("does not exist") ? "Run schema_patch_2.sql in Supabase first to enable daily counts." : err.message);
+    }
+  };
+
+  return (
+    <div>
+      <h2 className="text-base font-semibold text-slate-900 mb-4">Daily summary</h2>
+      <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
+      <form onSubmit={submitCount} className={`${card} max-w-md mb-5`}>
+        <p className="text-xs text-slate-500 mb-3">Enter today's physical count for a SKU. Open/close stock and the variance are calculated automatically from live system stock.</p>
+        <Field label="SKU code"><SkuSearchInput rest={rest} value={countForm.sku_code} onChange={(v) => setCountForm({ ...countForm, sku_code: v })} onSelect={(r) => setCountForm({ ...countForm, sku_code: r.sku_code })} /></Field>
+        <Field label="Physically counted quantity"><input className={inputCls} type="number" min="0" value={countForm.counted_qty} onChange={(e) => setCountForm({ ...countForm, counted_qty: e.target.value })} /></Field>
+        <button className={btnPrimary} type="submit">Log count</button>
+      </form>
+
+      <div className={card}>
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-slate-500 border-b border-slate-200">
+              <th className="py-1.5 font-medium">SKU</th>
+              <th className="py-1.5 font-medium">Date</th>
+              <th className="py-1.5 font-medium text-right">Open</th>
+              <th className="py-1.5 font-medium text-right">Close</th>
+              <th className="py-1.5 font-medium text-right">Counted</th>
+              <th className="py-1.5 font-medium text-right">Difference</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 && <tr><td colSpan={6} className="py-3 text-slate-400">No counts logged yet.</td></tr>}
+            {rows.map((r) => (
+              <tr key={`${r.sku_code}-${r.count_date}`} className="border-b border-slate-100 last:border-0">
+                <td className="py-1.5 font-mono">{r.sku_code}</td>
+                <td className="py-1.5 text-slate-500 text-xs">{r.count_date}</td>
+                <td className="py-1.5 text-right">{r.open_stock}</td>
+                <td className="py-1.5 text-right">{r.close_stock}</td>
+                <td className="py-1.5 text-right">{r.counted_qty}</td>
+                <td className={`py-1.5 text-right font-medium ${r.difference === 0 ? "text-emerald-700" : "text-red-600"}`}>{r.difference}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <Pager page={page} setPage={setPage} hasMore={hasMore} />
+      </div>
+    </div>
+  );
+}
+
+// Parses either:
+//  (a) the legacy "SKU Master List" export: columns include SKU CODE + COMBINED LOCATIONS
+//      (a comma-separated list of location codes, repeats = extra units at that location)
+//  (b) a flat format: columns sku_code, location_code, quantity (one row per sku+location)
+function parseInventoryRows(rows) {
+  if (!rows.length) return [];
+  const headerKeys = Object.keys(rows[0]).map((k) => k.trim().toUpperCase());
+  const out = []; // {sku_code, location_code, quantity}
+
+  if (headerKeys.includes("SKU CODE") && headerKeys.includes("COMBINED LOCATIONS")) {
+    for (const row of rows) {
+      const sku = String(row["SKU CODE"] ?? "").trim();
+      const combined = row["COMBINED LOCATIONS"];
+      if (!sku || !combined) continue;
+      const tally = {};
+      String(combined).split(",").map((s) => s.trim()).filter(Boolean).forEach((loc) => {
+        tally[loc] = (tally[loc] || 0) + 1;
+      });
+      Object.entries(tally).forEach(([location_code, quantity]) => out.push({ sku_code: sku, location_code, quantity }));
+    }
+    return out;
+  }
+
+  // flat format - find columns case-insensitively
+  const findKey = (target) => Object.keys(rows[0]).find((k) => k.trim().toLowerCase() === target);
+  const skuKey = findKey("sku_code") || findKey("sku code");
+  const locKey = findKey("location_code") || findKey("location");
+  const qtyKey = findKey("quantity") || findKey("qty");
+  if (!skuKey || !locKey) return [];
+  for (const row of rows) {
+    const sku = String(row[skuKey] ?? "").trim();
+    const loc = String(row[locKey] ?? "").trim();
+    if (!sku || !loc) continue;
+    out.push({ sku_code: sku, location_code: loc, quantity: Number(row[qtyKey] ?? 1) || 1 });
+  }
+  return out;
+}
+
+function BulkUpload({ rest }) {
+  const [fileName, setFileName] = useState("");
+  const [parsed, setParsed] = useState([]);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+  const [progress, setProgress] = useState(null); // {phase, done, total}
+  const [busy, setBusy] = useState(false);
+
+  const handleFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setError(""); setSuccess(""); setParsed([]);
+    setFileName(file.name);
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array" });
+      const sheetName = wb.SheetNames.find((n) => n.toLowerCase().includes("master")) || wb.SheetNames[0];
+      const sheet = wb.Sheets[sheetName];
+      // Find the real header row (skip title rows that are common in exported sheets)
+      const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
+      let headerRowIdx = raw.findIndex((r) => r.some((c) => String(c ?? "").toUpperCase().includes("SKU")));
+      if (headerRowIdx === -1) headerRowIdx = 0;
+      const rows = XLSX.utils.sheet_to_json(sheet, { range: headerRowIdx, defval: null });
+      const result = parseInventoryRows(rows);
+      if (result.length === 0) setError("Couldn't find recognizable columns. Expected 'SKU CODE' + 'COMBINED LOCATIONS', or 'sku_code' + 'location_code' (+ optional 'quantity').");
+      setParsed(result);
+    } catch (err) {
+      setError("Couldn't read that file: " + err.message);
+    }
+  };
+
+  // Sends one array of objects per request with an upsert Prefer header —
+  // this is a real bulk insert (one round trip per batch), not one call per row.
+  const bulkUpsert = async (table, records, onConflict, batchSize) => {
+    for (let i = 0; i < records.length; i += batchSize) {
+      const batch = records.slice(i, i + batchSize);
+      await rest(`${table}?on_conflict=${onConflict}`, {
+        method: "POST",
+        body: JSON.stringify(batch),
+        prefer: "resolution=merge-duplicates,return=minimal",
+      });
+      setProgress((p) => ({ ...p, done: Math.min(i + batchSize, records.length) }));
+    }
+  };
+
+  const runImport = async () => {
+    setBusy(true); setError(""); setSuccess("");
+    try {
+      const uniqueSkuList = [...new Set(parsed.map((r) => r.sku_code))].map((sku_code) => ({ sku_code }));
+      const uniqueLocList = [...new Set(parsed.map((r) => r.location_code))].map((location_code) => ({ location_code }));
+
+      setProgress({ phase: `Uploading ${uniqueSkuList.length} unique SKUs`, done: 0, total: uniqueSkuList.length });
+      await bulkUpsert("skus", uniqueSkuList, "sku_code", 2000);
+
+      setProgress({ phase: `Uploading ${uniqueLocList.length} unique locations`, done: 0, total: uniqueLocList.length });
+      await bulkUpsert("locations", uniqueLocList, "location_code", 2000);
+
+      setProgress({ phase: `Uploading ${parsed.length} stock levels`, done: 0, total: parsed.length });
+      await bulkUpsert("sku_stock", parsed, "sku_code,location_code", 1000);
+
+      setSuccess(`Imported ${uniqueSkuList.length} SKUs across ${parsed.length} SKU/location rows.`);
+      setParsed([]); setFileName(""); setProgress(null);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const uniqueSkus = new Set(parsed.map((r) => r.sku_code)).size;
+
+  return (
+    <div>
+      <h2 className="text-base font-semibold text-slate-900 mb-4">Bulk upload SKUs</h2>
+      <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
+      <div className={`${card} max-w-lg`}>
+        <p className="text-xs text-slate-500 mb-3">
+          Upload your SKU Master List export (.xlsx or .csv) directly — the "COMBINED LOCATIONS" column is understood automatically.
+          Built for large files (150,000+ SKUs) using real batch inserts, not one row at a time.
+          Existing SKUs are updated; new ones are created. Safe to re-run any time to sync your latest count.
+        </p>
+        <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFile} className="text-sm mb-4" />
+        {parsed.length > 0 && (
+          <div className="bg-slate-50 border border-slate-200 rounded-md px-3 py-2 text-sm mb-4">
+            Found <strong>{uniqueSkus}</strong> unique SKUs across <strong>{parsed.length}</strong> SKU/location rows in {fileName}.
+          </div>
+        )}
+        {progress && (
+          <div className="mb-4">
+            <div className="text-xs text-slate-600 mb-1">{progress.phase}</div>
+            <div className="w-full bg-slate-200 rounded-full h-2 mb-1">
+              <div className="bg-blue-700 h-2 rounded-full transition-all" style={{ width: `${(progress.done / progress.total) * 100}%` }} />
+            </div>
+            <div className="text-xs text-slate-500">{progress.done} / {progress.total}</div>
+          </div>
+        )}
+        <button disabled={parsed.length === 0 || busy} onClick={runImport} className={btnPrimary}>
+          {busy ? "Importing..." : `Import ${parsed.length || ""} rows`}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [session, setSession] = useState(null);
   const { rest, rpc } = useSupabase(session?.access_token);
-  const [page, setPage] = useState("dashboard");
+  const [page, setPage] = useState("overview");
 
   if (!session) return <LoginScreen onLogin={setSession} />;
 
   const nav = [
-    { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+    { id: "overview", label: "Stock overview", icon: LayoutDashboard },
+    { id: "dashboard", label: "SKU lookup / add", icon: Search },
     { id: "replenishment", label: "Replenishment", icon: ClipboardList },
     { id: "inbound", label: "Inbound", icon: ArrowDownToLine },
+    { id: "ledger", label: "Ledger", icon: ListTree },
+    { id: "summary", label: "Summary", icon: ClipboardCheck },
+    { id: "bulk", label: "Bulk upload", icon: UploadCloud },
   ];
 
   return (
@@ -540,9 +918,13 @@ export default function App() {
         </div>
       </div>
       <div className="flex-1 p-6 overflow-auto">
+        {page === "overview" && <StockOverview rest={rest} />}
         {page === "dashboard" && <Dashboard rest={rest} />}
         {page === "replenishment" && <Replenishment rest={rest} rpc={rpc} />}
         {page === "inbound" && <Inbound rest={rest} />}
+        {page === "ledger" && <Ledger rest={rest} />}
+        {page === "summary" && <Summary rest={rest} rpc={rpc} />}
+        {page === "bulk" && <BulkUpload rest={rest} />}
       </div>
     </div>
   );
