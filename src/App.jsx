@@ -305,22 +305,30 @@ function BulkReplenishRequest({ rest, stores, onDone }) {
       const skuKey = findColumn(rows[0], ["sku_code", "sku code", "sku"]);
       const qtyKey = findColumn(rows[0], ["quantity", "qty", "qty_requested", "qty requested"]);
       const storeKey = findColumn(rows[0], ["store", "store_name", "store name", "destination"]);
-      if (!skuKey || !qtyKey || !storeKey) {
-        setError("Expected columns for SKU code, quantity, and store. Found: " + Object.keys(rows[0]).join(", "));
+      if (!skuKey || !storeKey) {
+        setError("Expected columns for SKU code and store (quantity is optional — repeated SKU rows are counted automatically). Found: " + Object.keys(rows[0]).join(", "));
         return;
       }
       const storeByName = new Map(stores.map((s) => [s.name.trim().toLowerCase(), s.id]));
-      const out = [];
+      // Group by sku+store and SUM quantities. If there's no quantity column,
+      // each row counts as 1 unit — so a SKU scanned 5 times becomes qty 5,
+      // exactly like your raw scan lists.
+      const tally = new Map(); // key `${sku}|${storeId}` -> qty
       let firstUnmatched = "";
       for (const row of rows) {
         const sku = String(row[skuKey] ?? "").trim();
-        const qty = Number(row[qtyKey] ?? 0);
         const storeName = String(row[storeKey] ?? "").trim();
-        if (!sku || !qty) continue;
+        if (!sku || !storeName) continue;
         const storeId = storeByName.get(storeName.toLowerCase());
         if (!storeId) { if (!firstUnmatched) firstUnmatched = storeName; continue; }
-        out.push({ sku_code: sku, store_id: storeId, qty_requested: qty });
+        const qty = qtyKey ? Number(row[qtyKey] ?? 1) || 1 : 1;
+        const key = `${sku}|${storeId}`;
+        tally.set(key, (tally.get(key) || 0) + qty);
       }
+      const out = [...tally.entries()].map(([key, qty_requested]) => {
+        const [sku_code, storeId] = key.split("|");
+        return { sku_code, store_id: Number(storeId), qty_requested: qty };
+      });
       setUnmatchedStore(firstUnmatched);
       setParsed(out);
     } catch (err) {
@@ -346,7 +354,7 @@ function BulkReplenishRequest({ rest, stores, onDone }) {
   return (
     <div className={`${card} max-w-lg`}>
       <p className="text-xs text-slate-500 mb-3">
-        Upload a store's replenishment list (.xlsx or .csv) with columns for SKU code, quantity, and store name — every row becomes an open request, ready for pick lists.
+        Upload a store's replenishment list (.xlsx or .csv) with columns for SKU code and store name. If your list has one row per unit (the same SKU repeated, e.g. from a scan), that's fine — repeats are automatically counted as quantity. A quantity column is optional.
       </p>
       <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
       <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFile} className="text-sm mb-4" />
@@ -384,20 +392,27 @@ function BulkInboundReceive({ rest }) {
       const skuKey = findColumn(rows[0], ["sku_code", "sku code", "sku"]);
       const qtyKey = findColumn(rows[0], ["quantity", "qty", "qty_put_away", "put away", "put_away"]);
       const locKey = findColumn(rows[0], ["location", "location_code", "destination", "destination_location"]);
-      if (!skuKey || !qtyKey) {
-        setError("Expected columns for SKU code and quantity. Found: " + Object.keys(rows[0]).join(", "));
+      if (!skuKey) {
+        setError("Expected a column for SKU code (quantity is optional — repeated SKU rows, like a raw scan list, are counted automatically). Found: " + Object.keys(rows[0]).join(", "));
         return;
       }
-      let missing = 0;
-      const out = [];
+      // Group by sku+location and SUM quantities. With no quantity column,
+      // each row = 1 unit, so a SKU scanned 5 times in the shipment becomes qty 5.
+      const tally = new Map(); // key `${sku}|${location}` -> qty
       for (const row of rows) {
         const sku = String(row[skuKey] ?? "").trim();
-        const qty = Number(row[qtyKey] ?? 0);
+        if (!sku) continue;
         const loc = locKey ? String(row[locKey] ?? "").trim() : "";
-        if (!sku || !qty) continue;
-        if (!loc) missing += 1;
-        out.push({ sku_code: sku, qty_put_away: qty, location: loc });
+        const qty = qtyKey ? Number(row[qtyKey] ?? 1) || 1 : 1;
+        const key = `${sku}|${loc}`;
+        tally.set(key, (tally.get(key) || 0) + qty);
       }
+      let missing = 0;
+      const out = [...tally.entries()].map(([key, qty_put_away]) => {
+        const [sku_code, location] = key.split("|");
+        if (!location) missing += 1;
+        return { sku_code, qty_put_away, location };
+      });
       setMissingLocationCount(missing);
       setParsed(out);
     } catch (err) {
@@ -436,7 +451,7 @@ function BulkInboundReceive({ rest }) {
   return (
     <div className={`${card} max-w-lg`}>
       <p className="text-xs text-slate-500 mb-3">
-        Upload a shipment's packing list (.xlsx or .csv) — e.g. 1,000 SKUs received from one supplier at once. Columns needed: SKU code and quantity; a location column is optional if everything goes to the same spot.
+        Upload a shipment's packing list (.xlsx or .csv) — e.g. 1,000 SKUs received from one supplier at once. Just a SKU code column is enough: if the same SKU appears 5 times (a raw scan list), it's automatically counted as quantity 5. A quantity column and location column are optional.
       </p>
       <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
       <Field label="Supplier / vendor name"><input className={inputCls} value={meta.party_name} onChange={(e) => setMeta({ ...meta, party_name: e.target.value })} placeholder="e.g. Aramex" /></Field>
