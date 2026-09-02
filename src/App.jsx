@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { LogOut, Search, Plus, Package, ArrowDownToLine, ArrowUpFromLine, ClipboardList, LayoutDashboard, ScanLine, RefreshCw, AlertCircle, CheckCircle2, ListTree, UploadCloud, ClipboardCheck, ChevronLeft, ChevronRight } from "lucide-react";
+import { LogOut, Search, Plus, Package, ArrowDownToLine, ArrowUpFromLine, ClipboardList, LayoutDashboard, ScanLine, RefreshCw, AlertCircle, CheckCircle2, ListTree, UploadCloud, ClipboardCheck, ChevronLeft, ChevronRight, Trash2, Pencil } from "lucide-react";
 import * as XLSX from "xlsx";
 
 const SUPABASE_URL = "https://zaakpcdkxdvpfribryvt.supabase.co";
@@ -152,7 +152,7 @@ function SkuSearchInput({ rest, value, onChange, onSelect, placeholder }) {
   );
 }
 
-function Dashboard({ rest }) {
+function Dashboard({ rest, rpc }) {
   const [query, setQuery] = useState("");
   const [sku, setSku] = useState(null);
   const [stock, setStock] = useState([]);
@@ -160,6 +160,10 @@ function Dashboard({ rest }) {
   const [success, setSuccess] = useState("");
   const [showAdd, setShowAdd] = useState(false);
   const [newSku, setNewSku] = useState({ sku_code: "", style_code: "", category: "", color: "", size: "", description: "" });
+  const [editingLoc, setEditingLoc] = useState(null); // location_code currently being edited
+  const [editQty, setEditQty] = useState("");
+  const [newLoc, setNewLoc] = useState({ location_code: "", quantity: "" });
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   const loadStock = async (skuRow) => {
     setSku(skuRow);
@@ -172,6 +176,8 @@ function Dashboard({ rest }) {
     }
   };
 
+  const refreshStock = () => sku && loadStock(sku);
+
   const addSku = async (e) => {
     e.preventDefault();
     if (!newSku.sku_code) { setError("SKU code is required."); return; }
@@ -183,6 +189,49 @@ function Dashboard({ rest }) {
       setShowAdd(false);
     } catch (err) {
       setError(err.message);
+    }
+  };
+
+  const saveAdjustment = async (location_code) => {
+    setError(""); setSuccess("");
+    try {
+      await rpc("adjust_stock", { p_sku: sku.sku_code, p_location: location_code, p_new_qty: Number(editQty) || 0, p_reason: "Manual correction" });
+      setSuccess(`Updated ${sku.sku_code} at ${location_code} to ${Number(editQty) || 0}.`);
+      setEditingLoc(null);
+      refreshStock();
+    } catch (err) {
+      setError(err.message.includes("does not exist") ? "Run schema_patch_3.sql in Supabase first to enable stock adjustments." : err.message);
+    }
+  };
+
+  const addLocationStock = async (e) => {
+    e.preventDefault();
+    if (!newLoc.location_code || newLoc.quantity === "") { setError("Location and quantity are required."); return; }
+    setError(""); setSuccess("");
+    try {
+      await rpc("adjust_stock", { p_sku: sku.sku_code, p_location: newLoc.location_code, p_new_qty: Number(newLoc.quantity), p_reason: "Manual addition" });
+      setSuccess(`Added ${sku.sku_code} at ${newLoc.location_code}.`);
+      setNewLoc({ location_code: "", quantity: "" });
+      refreshStock();
+    } catch (err) {
+      setError(err.message.includes("does not exist") ? "Run schema_patch_3.sql in Supabase first to enable stock adjustments." : err.message);
+    }
+  };
+
+  const deleteSku = async () => {
+    setError(""); setSuccess("");
+    try {
+      const result = await rpc("delete_sku_if_unused", { p_sku: sku.sku_code });
+      if (result === "deleted") {
+        setSuccess(`${sku.sku_code} deleted.`);
+        setSku(null); setStock([]); setQuery("");
+      } else {
+        setError(result);
+      }
+      setConfirmDelete(false);
+    } catch (err) {
+      setError(err.message.includes("does not exist") ? "Run schema_patch_3.sql in Supabase first to enable SKU deletion." : err.message);
+      setConfirmDelete(false);
     }
   };
 
@@ -224,30 +273,69 @@ function Dashboard({ rest }) {
               <div className="text-lg font-semibold text-slate-900">{sku.sku_code}</div>
               <div className="text-sm text-slate-500">{[sku.style_code, sku.category, sku.color, sku.size].filter(Boolean).join(" · ")}</div>
             </div>
-            <div className="text-right">
-              <div className="text-xs text-slate-500">Total stock</div>
-              <div className="text-2xl font-semibold text-slate-900">{totalQty}</div>
+            <div className="flex items-start gap-4">
+              <div className="text-right">
+                <div className="text-xs text-slate-500">Total stock</div>
+                <div className="text-2xl font-semibold text-slate-900">{totalQty}</div>
+              </div>
+              <button onClick={() => setConfirmDelete(true)} title="Delete SKU" className="text-slate-400 hover:text-red-600 mt-1">
+                <Trash2 className="w-4 h-4" />
+              </button>
             </div>
           </div>
-          <table className="w-full text-sm">
+
+          {confirmDelete && (
+            <div className="bg-red-50 border border-red-200 rounded-md px-3 py-2 mb-3 text-sm text-red-800 flex items-center justify-between">
+              <span>Delete {sku.sku_code} permanently? Only allowed if it has no stock and no transaction history.</span>
+              <div className="flex gap-2 shrink-0 ml-3">
+                <button onClick={deleteSku} className="text-red-700 font-medium hover:underline">Yes, delete</button>
+                <button onClick={() => setConfirmDelete(false)} className="text-slate-500 hover:underline">Cancel</button>
+              </div>
+            </div>
+          )}
+
+          <table className="w-full text-sm mb-4">
             <thead>
               <tr className="text-left text-slate-500 border-b border-slate-200">
                 <th className="py-1.5 font-medium">Location</th>
                 <th className="py-1.5 font-medium text-right">Quantity</th>
+                <th className="py-1.5 font-medium text-right w-20">Adjust</th>
               </tr>
             </thead>
             <tbody>
               {stock.length === 0 && (
-                <tr><td colSpan={2} className="py-3 text-slate-400">No stock recorded for this SKU yet.</td></tr>
+                <tr><td colSpan={3} className="py-3 text-slate-400">No stock recorded for this SKU yet.</td></tr>
               )}
               {stock.map((r) => (
                 <tr key={r.location_code} className="border-b border-slate-100 last:border-0">
                   <td className="py-1.5 font-mono text-slate-800">{r.location_code}</td>
-                  <td className="py-1.5 text-right text-slate-900">{r.quantity}</td>
+                  <td className="py-1.5 text-right text-slate-900">
+                    {editingLoc === r.location_code ? (
+                      <input autoFocus type="number" min="0" className="w-20 border border-blue-500 rounded px-1 py-0.5 text-right text-sm" value={editQty} onChange={(e) => setEditQty(e.target.value)} onKeyDown={(e) => e.key === "Enter" && saveAdjustment(r.location_code)} />
+                    ) : r.quantity}
+                  </td>
+                  <td className="py-1.5 text-right">
+                    {editingLoc === r.location_code ? (
+                      <div className="flex justify-end gap-2">
+                        <button onClick={() => saveAdjustment(r.location_code)} className="text-emerald-700 hover:underline text-xs">Save</button>
+                        <button onClick={() => setEditingLoc(null)} className="text-slate-400 hover:underline text-xs">Cancel</button>
+                      </div>
+                    ) : (
+                      <button onClick={() => { setEditingLoc(r.location_code); setEditQty(String(r.quantity)); }} className="text-slate-400 hover:text-blue-700">
+                        <Pencil className="w-3.5 h-3.5 inline" />
+                      </button>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
+
+          <form onSubmit={addLocationStock} className="flex items-end gap-2 border-t border-slate-100 pt-3">
+            <div className="flex-1"><Field label="Add stock at new location"><input className={inputCls} value={newLoc.location_code} onChange={(e) => setNewLoc({ ...newLoc, location_code: e.target.value })} placeholder="Location code" /></Field></div>
+            <div className="w-28"><Field label="Quantity"><input className={inputCls} type="number" min="0" value={newLoc.quantity} onChange={(e) => setNewLoc({ ...newLoc, quantity: e.target.value })} /></Field></div>
+            <button type="submit" className={`${btnSecondary} mb-3`}>Add</button>
+          </form>
         </div>
       )}
     </div>
@@ -1169,7 +1257,7 @@ export default function App() {
       </div>
       <div className="flex-1 p-6 overflow-auto">
         {page === "overview" && <StockOverview rest={rest} />}
-        {page === "dashboard" && <Dashboard rest={rest} />}
+        {page === "dashboard" && <Dashboard rest={rest} rpc={rpc} />}
         {page === "replenishment" && <Replenishment rest={rest} rpc={rpc} />}
         {page === "inbound" && <Inbound rest={rest} />}
         {page === "ledger" && <Ledger rest={rest} />}
