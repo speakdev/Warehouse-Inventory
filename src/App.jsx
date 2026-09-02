@@ -152,7 +152,7 @@ function SkuSearchInput({ rest, value, onChange, onSelect, placeholder }) {
   );
 }
 
-function Dashboard({ rest, rpc }) {
+function Dashboard({ rest, rpc, isPrivileged }) {
   const [query, setQuery] = useState("");
   const [sku, setSku] = useState(null);
   const [stock, setStock] = useState([]);
@@ -241,14 +241,16 @@ function Dashboard({ rest, rpc }) {
     <div>
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-base font-semibold text-slate-900">SKU lookup</h2>
-        <button onClick={() => setShowAdd((v) => !v)} className={btnSecondary}>
-          <Plus className="w-4 h-4 inline -mt-0.5 mr-1" /> Add SKU
-        </button>
+        {isPrivileged && (
+          <button onClick={() => setShowAdd((v) => !v)} className={btnSecondary}>
+            <Plus className="w-4 h-4 inline -mt-0.5 mr-1" /> Add SKU
+          </button>
+        )}
       </div>
 
       <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
 
-      {showAdd && (
+      {showAdd && isPrivileged && (
         <form onSubmit={addSku} className={`${card} mb-5 grid grid-cols-2 gap-x-4`}>
           <Field label="SKU code"><input className={inputCls} value={newSku.sku_code} onChange={(e) => setNewSku({ ...newSku, sku_code: e.target.value })} /></Field>
           <Field label="Style code"><input className={inputCls} value={newSku.style_code} onChange={(e) => setNewSku({ ...newSku, style_code: e.target.value })} /></Field>
@@ -278,9 +280,11 @@ function Dashboard({ rest, rpc }) {
                 <div className="text-xs text-slate-500">Total stock</div>
                 <div className="text-2xl font-semibold text-slate-900">{totalQty}</div>
               </div>
-              <button onClick={() => setConfirmDelete(true)} title="Delete SKU" className="text-slate-400 hover:text-red-600 mt-1">
-                <Trash2 className="w-4 h-4" />
-              </button>
+              {isPrivileged && (
+                <button onClick={() => setConfirmDelete(true)} title="Delete SKU" className="text-slate-400 hover:text-red-600 mt-1">
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              )}
             </div>
           </div>
 
@@ -299,7 +303,7 @@ function Dashboard({ rest, rpc }) {
               <tr className="text-left text-slate-500 border-b border-slate-200">
                 <th className="py-1.5 font-medium">Location</th>
                 <th className="py-1.5 font-medium text-right">Quantity</th>
-                <th className="py-1.5 font-medium text-right w-20">Adjust</th>
+                {isPrivileged && <th className="py-1.5 font-medium text-right w-20">Adjust</th>}
               </tr>
             </thead>
             <tbody>
@@ -314,6 +318,7 @@ function Dashboard({ rest, rpc }) {
                       <input autoFocus type="number" min="0" className="w-20 border border-blue-500 rounded px-1 py-0.5 text-right text-sm" value={editQty} onChange={(e) => setEditQty(e.target.value)} onKeyDown={(e) => e.key === "Enter" && saveAdjustment(r.location_code)} />
                     ) : r.quantity}
                   </td>
+                  {isPrivileged && (
                   <td className="py-1.5 text-right">
                     {editingLoc === r.location_code ? (
                       <div className="flex justify-end gap-2">
@@ -326,16 +331,19 @@ function Dashboard({ rest, rpc }) {
                       </button>
                     )}
                   </td>
+                  )}
                 </tr>
               ))}
             </tbody>
           </table>
 
+          {isPrivileged && (
           <form onSubmit={addLocationStock} className="flex items-end gap-2 border-t border-slate-100 pt-3">
             <div className="flex-1"><Field label="Add stock at new location"><input className={inputCls} value={newLoc.location_code} onChange={(e) => setNewLoc({ ...newLoc, location_code: e.target.value })} placeholder="Location code" /></Field></div>
             <div className="w-28"><Field label="Quantity"><input className={inputCls} type="number" min="0" value={newLoc.quantity} onChange={(e) => setNewLoc({ ...newLoc, quantity: e.target.value })} /></Field></div>
             <button type="submit" className={`${btnSecondary} mb-3`}>Add</button>
           </form>
+          )}
         </div>
       )}
     </div>
@@ -1217,12 +1225,98 @@ function BulkUpload({ rest }) {
   );
 }
 
+function TeamAdmin({ rest }) {
+  const [rows, setRows] = useState([]);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+
+  const load = useCallback(async () => {
+    try {
+      const data = await rest("profiles?select=id,email,role&order=email");
+      setRows(data || []);
+    } catch (err) { setError(err.message); }
+  }, [rest]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const changeRole = async (id, role) => {
+    setError(""); setSuccess("");
+    try {
+      await rest(`profiles?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ role }), prefer: "return=minimal" });
+      setSuccess("Role updated.");
+      load();
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  return (
+    <div>
+      <h2 className="text-base font-semibold text-slate-900 mb-4">Team & permissions</h2>
+      <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
+      <div className={card}>
+        <p className="text-xs text-slate-500 mb-3">Everyone who has ever logged in appears here automatically as "picker" — promote trusted staff to supervisor or admin as needed. Only admin/supervisor can adjust stock, delete SKUs, or bulk-import the master SKU list.</p>
+        <table className="w-full text-sm">
+          <thead><tr className="text-left text-slate-500 border-b border-slate-200"><th className="py-1.5 font-medium">Email</th><th className="py-1.5 font-medium text-right">Role</th></tr></thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.id} className="border-b border-slate-100 last:border-0">
+                <td className="py-1.5">{r.email}</td>
+                <td className="py-1.5 text-right">
+                  <select className="border border-slate-300 rounded-md px-2 py-1 text-sm" value={r.role} onChange={(e) => changeRole(r.id, e.target.value)}>
+                    <option value="picker">Picker</option>
+                    <option value="supervisor">Supervisor</option>
+                    <option value="admin">Admin</option>
+                  </select>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [session, setSession] = useState(null);
+  const [role, setRole] = useState(null);
   const { rest, rpc } = useSupabase(session?.access_token);
   const [page, setPage] = useState("overview");
 
+  // Fetch the logged-in user's role once we have a session.
+  useEffect(() => {
+    if (!session) { setRole(null); return; }
+    rest(`profiles?select=role&id=eq.${session.user.id}`)
+      .then((rows) => setRole(rows?.[0]?.role || "picker"))
+      .catch(() => setRole("picker"));
+  }, [session, rest]);
+
+  // Keep the session alive: Supabase access tokens expire (default ~1 hour).
+  // Refresh a bit early using the refresh_token so a shift-long session
+  // doesn't silently start failing requests.
+  useEffect(() => {
+    if (!session?.refresh_token) return;
+    const expiresInMs = (session.expires_in || 3600) * 1000;
+    const refreshInMs = Math.max(expiresInMs - 5 * 60 * 1000, 30 * 1000); // 5 min early
+    const t = setTimeout(async () => {
+      try {
+        const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+          method: "POST",
+          headers: { apikey: ANON_KEY, "Content-Type": "application/json" },
+          body: JSON.stringify({ refresh_token: session.refresh_token }),
+        });
+        const data = await res.json();
+        if (res.ok) setSession(data);
+      } catch { /* if this fails, the user will just be asked to log in again on next action */ }
+    }, refreshInMs);
+    return () => clearTimeout(t);
+  }, [session]);
+
   if (!session) return <LoginScreen onLogin={setSession} />;
+
+  const isPrivileged = role === "admin" || role === "supervisor";
+  const isAdmin = role === "admin";
 
   const nav = [
     { id: "overview", label: "Stock overview", icon: LayoutDashboard },
@@ -1231,7 +1325,8 @@ export default function App() {
     { id: "inbound", label: "Inbound", icon: ArrowDownToLine },
     { id: "ledger", label: "Ledger", icon: ListTree },
     { id: "summary", label: "Summary", icon: ClipboardCheck },
-    { id: "bulk", label: "Bulk upload", icon: UploadCloud },
+    ...(isPrivileged ? [{ id: "bulk", label: "Bulk upload", icon: UploadCloud }] : []),
+    ...(isAdmin ? [{ id: "team", label: "Team", icon: ScanLine }] : []),
   ];
 
   return (
@@ -1249,7 +1344,8 @@ export default function App() {
           ))}
         </nav>
         <div className="p-3 border-t border-slate-200">
-          <div className="text-xs text-slate-500 truncate mb-2">{session.user?.email}</div>
+          <div className="text-xs text-slate-500 truncate">{session.user?.email}</div>
+          <div className="text-xs text-slate-400 capitalize mb-2">{role || "..."}</div>
           <button onClick={() => setSession(null)} className="w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm text-slate-600 hover:bg-slate-50">
             <LogOut className="w-4 h-4" /> Sign out
           </button>
@@ -1257,12 +1353,13 @@ export default function App() {
       </div>
       <div className="flex-1 p-6 overflow-auto">
         {page === "overview" && <StockOverview rest={rest} />}
-        {page === "dashboard" && <Dashboard rest={rest} rpc={rpc} />}
+        {page === "dashboard" && <Dashboard rest={rest} rpc={rpc} isPrivileged={isPrivileged} />}
         {page === "replenishment" && <Replenishment rest={rest} rpc={rpc} />}
         {page === "inbound" && <Inbound rest={rest} />}
         {page === "ledger" && <Ledger rest={rest} />}
         {page === "summary" && <Summary rest={rest} rpc={rpc} />}
-        {page === "bulk" && <BulkUpload rest={rest} />}
+        {page === "bulk" && isPrivileged && <BulkUpload rest={rest} />}
+        {page === "team" && isAdmin && <TeamAdmin rest={rest} />}
       </div>
     </div>
   );
