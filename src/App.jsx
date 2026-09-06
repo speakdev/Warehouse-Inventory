@@ -423,7 +423,7 @@ function BulkReplenishRequest({ rest, stores, onDone }) {
       }
       const out = [...tally.entries()].map(([key, qty_requested]) => {
         const [sku_code, storeId] = key.split("|");
-        return { sku_code, store_id: Number(storeId), qty_requested: qty };
+        return { sku_code, store_id: Number(storeId), qty_requested };
       });
       setUnmatchedStore(firstUnmatched);
       setParsed(out);
