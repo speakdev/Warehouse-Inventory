@@ -434,10 +434,28 @@ function BulkReplenishRequest({ rest, stores, onDone }) {
 
   const runImport = async () => {
     setBusy(true); setError(""); setSuccess("");
-    setProgress({ done: 0, total: parsed.length });
     try {
-      await bulkInsert(rest, "replenishment_requests", parsed, 500, setProgress);
-      setSuccess(`Created ${parsed.length} replenishment requests.`);
+      // Group into one ORDER per store, so the whole uploaded list becomes
+      // a single order/invoice with many line items — not scattered
+      // individual requests.
+      const byStore = new Map();
+      for (const row of parsed) {
+        if (!byStore.has(row.store_id)) byStore.set(row.store_id, []);
+        byStore.get(row.store_id).push(row);
+      }
+      const total = parsed.length;
+      let done = 0;
+      setProgress({ done: 0, total });
+      let ordersCreated = 0;
+      for (const [storeId, lines] of byStore.entries()) {
+        const orderRows = await rest("replenishment_orders", { method: "POST", body: JSON.stringify({ store_id: storeId }), prefer: "return=representation" });
+        const orderId = orderRows[0].id;
+        const records = lines.map((l) => ({ sku_code: l.sku_code, store_id: l.store_id, qty_requested: l.qty_requested, order_id: orderId }));
+        await bulkInsert(rest, "replenishment_requests", records, 500, (p) => setProgress({ done: done + p.done, total }));
+        done += lines.length;
+        ordersCreated += 1;
+      }
+      setSuccess(`Created ${ordersCreated} order(s) covering ${total} SKU lines.`);
       setParsed([]); setFileName(""); setProgress(null);
       onDone?.();
     } catch (err) {
@@ -450,394 +468,198 @@ function BulkReplenishRequest({ rest, stores, onDone }) {
   return (
     <div className={`${card} max-w-lg`}>
       <p className="text-xs text-slate-500 mb-3">
-        Upload a store's replenishment list (.xlsx or .csv) with columns for SKU code and store name. If your list has one row per unit (the same SKU repeated, e.g. from a scan), that's fine — repeats are automatically counted as quantity. A quantity column is optional.
+        Upload a store's replenishment list (.xlsx or .csv) with columns for SKU code and store name. If your list has one row per unit (the same SKU repeated, e.g. from a scan), that's fine — repeats are automatically counted as quantity. A quantity column is optional. Every store in the file becomes one order — like a single invoice with multiple line items — ready to pick as one unit.
       </p>
       <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
       <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFile} className="text-sm mb-4" />
       {unmatchedStore && <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-3 py-2 mb-3">Some rows use a store name that doesn't match your store list (e.g. "{unmatchedStore}") — those rows were skipped. Store names must match exactly: {stores.map((s) => s.name).join(", ")}.</div>}
-      {parsed.length > 0 && <div className="bg-slate-50 border border-slate-200 rounded-md px-3 py-2 text-sm mb-4">Found <strong>{parsed.length}</strong> valid request rows in {fileName}.</div>}
+      {parsed.length > 0 && <div className="bg-slate-50 border border-slate-200 rounded-md px-3 py-2 text-sm mb-4">Found <strong>{parsed.length}</strong> valid line item(s) across <strong>{new Set(parsed.map((r) => r.store_id)).size}</strong> store order(s) in {fileName}.</div>}
       {progress && (
         <div className="mb-4">
           <div className="w-full bg-slate-200 rounded-full h-2 mb-1"><div className="bg-blue-700 h-2 rounded-full transition-all" style={{ width: `${(progress.done / progress.total) * 100}%` }} /></div>
           <div className="text-xs text-slate-500">{progress.done} / {progress.total}</div>
         </div>
       )}
-      <button disabled={parsed.length === 0 || busy} onClick={runImport} className={btnPrimary}>{busy ? "Creating..." : `Create ${parsed.length || ""} requests`}</button>
+      <button disabled={parsed.length === 0 || busy} onClick={runImport} className={btnPrimary}>{busy ? "Creating..." : `Create order(s) from ${parsed.length || ""} lines`}</button>
     </div>
   );
 }
 
-function BulkInboundReceive({ rest }) {
-  const [meta, setMeta] = useState({ party_name: "", txn_type: "purchase", default_location: "" });
+// Auto-assigns a put-away location per line: if the SKU already has stock
+// somewhere, consolidate onto that location; otherwise claim the next
+// truly empty location so different new SKUs don't collide on one spot.
+async function planPutaway(rest, lines) {
+  const uniqueSkus = [...new Set(lines.map((l) => l.sku_code))];
+  const existingBySku = new Map();
+  if (uniqueSkus.length) {
+    const inList = uniqueSkus.map((s) => encodeURIComponent(s)).join(",");
+    const existing = await rest(`sku_stock?select=sku_code,location_code,quantity&sku_code=in.(${inList})&order=quantity.desc`);
+    (existing || []).forEach((r) => { if (!existingBySku.has(r.sku_code)) existingBySku.set(r.sku_code, r.location_code); });
+  }
+  let emptyQueue = [];
+  try {
+    const emptyRows = await rest(`empty_locations?select=location_code&order=location_code&limit=${lines.length + 20}`);
+    emptyQueue = (emptyRows || []).map((r) => r.location_code);
+  } catch { /* falls back to blank, user fills in manually if this errors */ }
+  const usedEmpty = new Set();
+  return lines.map((line) => {
+    let location_code = existingBySku.get(line.sku_code);
+    let isNew = false;
+    if (!location_code) {
+      location_code = emptyQueue.find((l) => !usedEmpty.has(l)) || "";
+      if (location_code) usedEmpty.add(location_code);
+      isNew = true;
+    }
+    return { ...line, location_code, isNew };
+  });
+}
+
+function Inbound({ rest }) {
+  const [meta, setMeta] = useState({ party_name: "", txn_type: "purchase" });
+  const [lines, setLines] = useState([{ sku_code: "", qty: "" }]);
   const [fileName, setFileName] = useState("");
-  const [parsed, setParsed] = useState([]);
-  const [missingLocationCount, setMissingLocationCount] = useState(0);
+  const [plan, setPlan] = useState(null); // null until generated
+  const [planLoading, setPlanLoading] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
-  const [progress, setProgress] = useState(null);
   const [busy, setBusy] = useState(false);
+
+  const updateLine = (i, patch) => setLines((ls) => ls.map((l, idx) => (idx === i ? { ...l, ...patch } : l)));
+  const addLine = () => setLines((ls) => [...ls, { sku_code: "", qty: "" }]);
+  const removeLine = (i) => setLines((ls) => ls.filter((_, idx) => idx !== i));
 
   const handleFile = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    setError(""); setSuccess(""); setParsed([]);
+    setError(""); setSuccess(""); setPlan(null);
     setFileName(file.name);
     try {
       const rows = await readSheetRows(file);
       if (!rows.length) { setError("That file has no rows."); return; }
       const skuKey = findColumn(rows[0], ["sku_code", "sku code", "sku"]);
       const qtyKey = findColumn(rows[0], ["quantity", "qty", "qty_put_away", "put away", "put_away"]);
-      const locKey = findColumn(rows[0], ["location", "location_code", "destination", "destination_location"]);
       if (!skuKey) {
         setError("Expected a column for SKU code (quantity is optional — repeated SKU rows, like a raw scan list, are counted automatically). Found: " + Object.keys(rows[0]).join(", "));
         return;
       }
-      // Group by sku+location and SUM quantities. With no quantity column,
-      // each row = 1 unit, so a SKU scanned 5 times in the shipment becomes qty 5.
-      const tally = new Map(); // key `${sku}|${location}` -> qty
+      // Group by sku and SUM quantities — a raw scan list (same SKU repeated
+      // once per unit) becomes one line with the total quantity.
+      const tally = new Map();
       for (const row of rows) {
         const sku = String(row[skuKey] ?? "").trim();
         if (!sku) continue;
-        const loc = locKey ? String(row[locKey] ?? "").trim() : "";
         const qty = qtyKey ? Number(row[qtyKey] ?? 1) || 1 : 1;
-        const key = `${sku}|${loc}`;
-        tally.set(key, (tally.get(key) || 0) + qty);
+        tally.set(sku, (tally.get(sku) || 0) + qty);
       }
-      let missing = 0;
-      const out = [...tally.entries()].map(([key, qty_put_away]) => {
-        const [sku_code, location] = key.split("|");
-        if (!location) missing += 1;
-        return { sku_code, qty_put_away, location };
-      });
-      setMissingLocationCount(missing);
-      setParsed(out);
+      setLines([...tally.entries()].map(([sku_code, qty]) => ({ sku_code, qty: String(qty) })));
     } catch (err) {
       setError("Couldn't read that file: " + err.message);
     }
   };
 
-  const runImport = async () => {
-    if (missingLocationCount > 0 && !meta.default_location) {
-      setError(`${missingLocationCount} row(s) have no location in the file — set a default put-away location above, or add a location column to the file.`);
-      return;
-    }
+  const generatePlan = async () => {
+    const validLines = lines.filter((l) => l.sku_code && Number(l.qty) > 0).map((l) => ({ sku_code: l.sku_code, qty: Number(l.qty) }));
     if (!meta.party_name) { setError("Enter the supplier/vendor name for this shipment."); return; }
-    setBusy(true); setError(""); setSuccess("");
-    setProgress({ done: 0, total: parsed.length });
+    if (validLines.length === 0) { setError("Add at least one SKU and quantity, or upload a packing list."); return; }
+    setError(""); setSuccess(""); setPlanLoading(true);
     try {
-      const records = parsed.map((r) => ({
-        sku_code: r.sku_code,
+      const result = await planPutaway(rest, validLines);
+      setPlan(result);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setPlanLoading(false);
+    }
+  };
+
+  const updatePlanLocation = (i, location_code) => setPlan((p) => p.map((l, idx) => (idx === i ? { ...l, location_code } : l)));
+
+  const confirmPutaway = async () => {
+    if (!plan) return;
+    const missing = plan.filter((l) => !l.location_code);
+    if (missing.length > 0) { setError(`${missing.length} line(s) have no assigned location — fill them in manually before confirming (you may be out of empty locations).`); return; }
+    setBusy(true); setError(""); setSuccess("");
+    try {
+      const records = plan.map((l) => ({
+        sku_code: l.sku_code,
         txn_type: meta.txn_type,
         party_name: meta.party_name,
-        qty_picked: r.qty_put_away,
-        qty_packed: r.qty_put_away,
-        qty_put_away: r.qty_put_away,
-        destination_location: r.location || meta.default_location,
+        qty_picked: l.qty,
+        qty_packed: l.qty,
+        qty_put_away: l.qty,
+        destination_location: l.location_code,
       }));
-      await bulkInsert(rest, "inbound_transactions", records, 500, setProgress);
-      setSuccess(`Logged inbound receipt for ${parsed.length} SKUs from ${meta.party_name}. Stock updated.`);
-      setParsed([]); setFileName(""); setProgress(null);
+      await bulkInsert(rest, "inbound_transactions", records, 500);
+      setSuccess(`Put away ${plan.length} SKU(s) from ${meta.party_name}. Stock updated at every assigned location.`);
+      setPlan(null); setLines([{ sku_code: "", qty: "" }]); setFileName(""); setMeta({ party_name: "", txn_type: "purchase" });
     } catch (err) {
-      setError(err.message.includes("foreign key") ? "Some SKU codes in that file aren't in the master list yet — add them first (Dashboard or Bulk upload SKUs)." : err.message);
+      setError(err.message.includes("foreign key") ? "Some SKU codes aren't in the master list yet — add them first (Dashboard or Bulk upload SKUs)." : err.message);
     } finally {
       setBusy(false);
     }
   };
 
   return (
-    <div className={`${card} max-w-lg`}>
-      <p className="text-xs text-slate-500 mb-3">
-        Upload a shipment's packing list (.xlsx or .csv) — e.g. 1,000 SKUs received from one supplier at once. Just a SKU code column is enough: if the same SKU appears 5 times (a raw scan list), it's automatically counted as quantity 5. A quantity column and location column are optional.
-      </p>
-      <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
-      <Field label="Supplier / vendor name"><input className={inputCls} value={meta.party_name} onChange={(e) => setMeta({ ...meta, party_name: e.target.value })} placeholder="e.g. Aramex" /></Field>
-      <Field label="Transaction type">
-        <select className={inputCls} value={meta.txn_type} onChange={(e) => setMeta({ ...meta, txn_type: e.target.value })}>
-          <option value="purchase">Purchase</option>
-          <option value="returns">Returns</option>
-          <option value="retrieval">Retrieval</option>
-        </select>
-      </Field>
-      <Field label="Default put-away location (used if the file has no location column, or a row is blank)"><input className={inputCls} value={meta.default_location} onChange={(e) => setMeta({ ...meta, default_location: e.target.value })} placeholder="e.g. RECEIVING-01" /></Field>
-      <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFile} className="text-sm mb-4" />
-      {parsed.length > 0 && <div className="bg-slate-50 border border-slate-200 rounded-md px-3 py-2 text-sm mb-4">Found <strong>{parsed.length}</strong> SKU rows in {fileName}{missingLocationCount > 0 ? ` (${missingLocationCount} with no location in the file — will use your default)` : ""}.</div>}
-      {progress && (
-        <div className="mb-4">
-          <div className="w-full bg-slate-200 rounded-full h-2 mb-1"><div className="bg-blue-700 h-2 rounded-full transition-all" style={{ width: `${(progress.done / progress.total) * 100}%` }} /></div>
-          <div className="text-xs text-slate-500">{progress.done} / {progress.total}</div>
-        </div>
-      )}
-      <button disabled={parsed.length === 0 || busy} onClick={runImport} className={btnPrimary}>{busy ? "Logging..." : `Log ${parsed.length || ""} inbound units`}</button>
-    </div>
-  );
-}
-
-function Replenishment({ rest, rpc }) {
-  const [tab, setTab] = useState("new");
-  const [error, setError] = useState("");
-  const [success, setSuccess] = useState("");
-
-  const [stores, setStores] = useState([]);
-  const [reqForm, setReqForm] = useState({ sku_code: "", store_id: "", qty_requested: "" });
-
-  const [openRequests, setOpenRequests] = useState([]);
-  const [selectedReq, setSelectedReq] = useState(null);
-  const [pickLocations, setPickLocations] = useState([]);
-  const [pickForm, setPickForm] = useState({ source_location: "", qty_picked: "", qty_packed: "", party_name: "" });
-
-  const [verifyForm, setVerifyForm] = useState({ sku_code_requested: "", qty_requested: "", sku_code_scanned: "", qty_scanned: "" });
-
-  useEffect(() => {
-    rest("stores?select=id,name&order=name").then(setStores).catch((e) => setError(e.message));
-  }, [rest]);
-
-  const loadOpenRequests = useCallback(async () => {
-    try {
-      const rows = await rest("replenishment_requests?select=id,sku_code,qty_requested,status,stores(name)&status=eq.open&order=created_at.desc&limit=50");
-      setOpenRequests(rows || []);
-    } catch (err) { setError(err.message); }
-  }, [rest]);
-
-  useEffect(() => { if (tab === "pick") loadOpenRequests(); }, [tab, loadOpenRequests]);
-
-  const submitRequest = async (e) => {
-    e.preventDefault();
-    if (!reqForm.sku_code || !reqForm.store_id || !reqForm.qty_requested) { setError("All fields are required."); return; }
-    setError(""); setSuccess("");
-    try {
-      await rest("replenishment_requests", {
-        method: "POST",
-        body: JSON.stringify({ sku_code: reqForm.sku_code, store_id: Number(reqForm.store_id), qty_requested: Number(reqForm.qty_requested) }),
-      });
-      setSuccess(`Replenishment request created for ${reqForm.sku_code}.`);
-      setReqForm({ sku_code: "", store_id: "", qty_requested: "" });
-    } catch (err) { setError(err.message); }
-  };
-
-  const selectRequest = async (r) => {
-    setSelectedReq(r);
-    setError("");
-    try {
-      const rows = await rpc("get_pick_locations", { p_sku: r.sku_code, p_qty: r.qty_requested });
-      setPickLocations(rows || []);
-    } catch (err) { setError(err.message); }
-  };
-
-  const submitPick = async (e) => {
-    e.preventDefault();
-    if (!selectedReq) return;
-    if (!pickForm.source_location || !pickForm.qty_picked) { setError("Pick location and quantity are required."); return; }
-    setError(""); setSuccess("");
-    try {
-      await rest("replenishment_transactions", {
-        method: "POST",
-        body: JSON.stringify({
-          request_id: selectedReq.id,
-          sku_code: selectedReq.sku_code,
-          source_location: pickForm.source_location,
-          qty_picked: Number(pickForm.qty_picked),
-          qty_packed: Number(pickForm.qty_packed || pickForm.qty_picked),
-          party_name: pickForm.party_name,
-        }),
-      });
-      await rest(`replenishment_requests?id=eq.${selectedReq.id}`, { method: "PATCH", body: JSON.stringify({ status: "issued" }) });
-      setSuccess(`Picked ${pickForm.qty_picked} of ${selectedReq.sku_code} from ${pickForm.source_location}. Stock updated.`);
-      setSelectedReq(null); setPickLocations([]); setPickForm({ source_location: "", qty_picked: "", qty_packed: "", party_name: "" });
-      loadOpenRequests();
-    } catch (err) { setError(err.message); }
-  };
-
-  const submitVerify = async (e) => {
-    e.preventDefault();
-    if (!verifyForm.sku_code_requested) { setError("Enter the SKU that was on the pick list."); return; }
-    setError(""); setSuccess("");
-    try {
-      await rest("replenishment_list_items", {
-        method: "POST",
-        body: JSON.stringify({
-          sku_code_requested: verifyForm.sku_code_requested,
-          qty_requested: Number(verifyForm.qty_requested || 0),
-          sku_code_scanned: verifyForm.sku_code_scanned || verifyForm.sku_code_requested,
-          qty_scanned: Number(verifyForm.qty_scanned || 0),
-        }),
-      });
-      const diff = Number(verifyForm.qty_scanned || 0) - Number(verifyForm.qty_requested || 0);
-      setSuccess(diff === 0 ? "Match confirmed, no variance." : `Logged with a variance of ${diff}.`);
-      setVerifyForm({ sku_code_requested: "", qty_requested: "", sku_code_scanned: "", qty_scanned: "" });
-    } catch (err) { setError(err.message); }
-  };
-
-  const tabBtn = (id, label) => (
-    <button onClick={() => { setTab(id); setError(""); setSuccess(""); }} className={`px-3 py-1.5 text-sm rounded-md font-medium ${tab === id ? "bg-blue-700 text-white" : "text-slate-600 hover:bg-slate-100"}`}>
-      {label}
-    </button>
-  );
-
-  return (
     <div>
-      <div className="flex gap-1 mb-4">
-        {tabBtn("new", "New request")}
-        {tabBtn("bulk", "Bulk request")}
-        {tabBtn("pick", "Pick list")}
-        {tabBtn("verify", "Verify scan")}
-      </div>
-
+      <h2 className="text-base font-semibold text-slate-900 mb-4">Receive inbound shipment</h2>
       <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
 
-      {tab === "bulk" && <BulkReplenishRequest rest={rest} stores={stores} onDone={loadOpenRequests} />}
-
-      {tab === "new" && (
-        <form onSubmit={submitRequest} className={`${card} max-w-md`}>
-          <Field label="SKU code"><SkuSearchInput rest={rest} value={reqForm.sku_code} onChange={(v) => setReqForm({ ...reqForm, sku_code: v })} onSelect={(r) => setReqForm({ ...reqForm, sku_code: r.sku_code })} /></Field>
-          <Field label="Destination store">
-            <select className={inputCls} value={reqForm.store_id} onChange={(e) => setReqForm({ ...reqForm, store_id: e.target.value })}>
-              <option value="">Select a store</option>
-              {stores.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+      {!plan && (
+        <div className={`${card} max-w-xl`}>
+          <p className="text-xs text-slate-500 mb-3">List what you received (manually, or upload a packing list/scan export below) — locations are assigned automatically: existing SKUs consolidate onto their current shelf, new SKUs claim the next empty one.</p>
+          <Field label="Supplier / vendor name"><input className={inputCls} value={meta.party_name} onChange={(e) => setMeta({ ...meta, party_name: e.target.value })} placeholder="e.g. Aramex" /></Field>
+          <Field label="Transaction type">
+            <select className={inputCls} value={meta.txn_type} onChange={(e) => setMeta({ ...meta, txn_type: e.target.value })}>
+              <option value="purchase">Purchase</option>
+              <option value="returns">Returns</option>
+              <option value="retrieval">Retrieval</option>
             </select>
           </Field>
-          <Field label="Quantity requested"><input className={inputCls} type="number" min="1" value={reqForm.qty_requested} onChange={(e) => setReqForm({ ...reqForm, qty_requested: e.target.value })} /></Field>
-          <button className={btnPrimary} type="submit">Create request</button>
-        </form>
+
+          <div className="mb-3">
+            <span className="block text-xs font-medium text-slate-500 mb-1">Upload a packing list (optional — fills in the lines below)</span>
+            <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFile} className="text-sm" />
+            {fileName && <div className="text-xs text-slate-500 mt-1">{lines.length} SKU line(s) loaded from {fileName}</div>}
+          </div>
+
+          <div className="space-y-2 mb-3">
+            {lines.map((line, i) => (
+              <div key={i} className="flex gap-2 items-start">
+                <div className="flex-1"><SkuSearchInput rest={rest} value={line.sku_code} onChange={(v) => updateLine(i, { sku_code: v })} onSelect={(r) => updateLine(i, { sku_code: r.sku_code })} placeholder="SKU code" /></div>
+                <input className={`${inputCls} w-24`} type="number" min="1" placeholder="Qty" value={line.qty} onChange={(e) => updateLine(i, { qty: e.target.value })} />
+                <button type="button" onClick={() => removeLine(i)} className="text-slate-400 hover:text-red-600 px-2 py-2">&times;</button>
+              </div>
+            ))}
+          </div>
+          <button type="button" onClick={addLine} className={`${btnSecondary} mb-4`}>+ Add another SKU</button>
+          <div><button onClick={generatePlan} disabled={planLoading} className={btnPrimary}>{planLoading ? "Assigning locations..." : "Generate putaway list"}</button></div>
+        </div>
       )}
 
-      {tab === "pick" && (
-        <div className="grid grid-cols-2 gap-5">
-          <div className={card}>
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="text-sm font-semibold text-slate-900">Open requests</h3>
-              <button onClick={loadOpenRequests} className="text-slate-400 hover:text-slate-700"><RefreshCw className="w-4 h-4" /></button>
-            </div>
-            <div className="space-y-1 max-h-96 overflow-auto">
-              {openRequests.length === 0 && <div className="text-sm text-slate-400">No open requests.</div>}
-              {openRequests.map((r) => (
-                <button key={r.id} onClick={() => selectRequest(r)} className={`w-full text-left px-3 py-2 rounded-md text-sm border ${selectedReq?.id === r.id ? "border-blue-600 bg-blue-50" : "border-slate-200 hover:bg-slate-50"}`}>
-                  <div className="font-medium text-slate-900">{r.sku_code} &middot; {r.qty_requested} units</div>
-                  <div className="text-xs text-slate-500">{r.stores?.name}</div>
-                </button>
+      {plan && (
+        <div className={`${card} max-w-2xl`}>
+          <h3 className="text-sm font-semibold text-slate-900 mb-1">Putaway list — {meta.party_name}</h3>
+          <p className="text-xs text-slate-500 mb-3">Review the assigned locations below (edit any that need correcting), then confirm to log receipt and update stock.</p>
+          <table className="w-full text-sm mb-4">
+            <thead><tr className="text-left text-slate-500 border-b border-slate-200"><th className="py-1 font-medium">SKU</th><th className="py-1 font-medium text-right">Qty</th><th className="py-1 font-medium">Put away at</th></tr></thead>
+            <tbody>
+              {plan.map((l, i) => (
+                <tr key={i} className="border-b border-slate-100 last:border-0">
+                  <td className="py-1 font-mono">{l.sku_code}</td>
+                  <td className="py-1 text-right">{l.qty}</td>
+                  <td className="py-1">
+                    <input className={`${inputCls} font-mono text-xs py-1`} value={l.location_code} onChange={(e) => updatePlanLocation(i, e.target.value)} placeholder={!l.location_code ? "No empty location found — enter one" : ""} />
+                    {l.isNew && <span className="text-xs text-blue-600 ml-1">new bin</span>}
+                  </td>
+                </tr>
               ))}
-            </div>
-          </div>
-
-          <div className={card}>
-            <h3 className="text-sm font-semibold text-slate-900 mb-3">Pick locations {selectedReq ? `for ${selectedReq.sku_code}` : ""}</h3>
-            {!selectedReq && <div className="text-sm text-slate-400">Select a request to see live pick locations.</div>}
-            {selectedReq && (
-              <>
-                <table className="w-full text-sm mb-4">
-                  <thead><tr className="text-left text-slate-500 border-b border-slate-200"><th className="py-1 font-medium">Location</th><th className="py-1 font-medium text-right">Available now</th></tr></thead>
-                  <tbody>
-                    {pickLocations.length === 0 && <tr><td colSpan={2} className="py-2 text-red-600">No stock currently available anywhere.</td></tr>}
-                    {pickLocations.map((l) => (
-                      <tr key={l.location_code} className="border-b border-slate-100 last:border-0">
-                        <td className="py-1 font-mono">{l.location_code}</td>
-                        <td className="py-1 text-right">{l.available_qty}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                <form onSubmit={submitPick}>
-                  <Field label="Pick from location">
-                    <select className={inputCls} value={pickForm.source_location} onChange={(e) => setPickForm({ ...pickForm, source_location: e.target.value })}>
-                      <option value="">Select location</option>
-                      {pickLocations.map((l) => <option key={l.location_code} value={l.location_code}>{l.location_code} ({l.available_qty} available)</option>)}
-                    </select>
-                  </Field>
-                  <div className="grid grid-cols-2 gap-3">
-                    <Field label="Qty picked"><input className={inputCls} type="number" min="1" value={pickForm.qty_picked} onChange={(e) => setPickForm({ ...pickForm, qty_picked: e.target.value })} /></Field>
-                    <Field label="Qty packed"><input className={inputCls} type="number" min="0" value={pickForm.qty_packed} onChange={(e) => setPickForm({ ...pickForm, qty_packed: e.target.value })} /></Field>
-                  </div>
-                  <Field label="Picked/packed by"><input className={inputCls} value={pickForm.party_name} onChange={(e) => setPickForm({ ...pickForm, party_name: e.target.value })} /></Field>
-                  <button className={btnPrimary} type="submit">Log pick and dispatch</button>
-                </form>
-              </>
-            )}
+            </tbody>
+          </table>
+          <div className="flex gap-2">
+            <button onClick={confirmPutaway} disabled={busy} className={btnPrimary}>{busy ? "Confirming..." : "Confirm putaway"}</button>
+            <button onClick={() => setPlan(null)} className={btnSecondary}>Back to edit</button>
           </div>
         </div>
-      )}
-
-      {tab === "verify" && (
-        <form onSubmit={submitVerify} className={`${card} max-w-md`}>
-          <p className="text-xs text-slate-500 mb-3">Scan or type what the pick list said, then what was actually scanned off the shelf.</p>
-          <Field label="SKU on pick list"><input className={inputCls} value={verifyForm.sku_code_requested} onChange={(e) => setVerifyForm({ ...verifyForm, sku_code_requested: e.target.value })} /></Field>
-          <Field label="Quantity on pick list"><input className={inputCls} type="number" value={verifyForm.qty_requested} onChange={(e) => setVerifyForm({ ...verifyForm, qty_requested: e.target.value })} /></Field>
-          <Field label="SKU scanned"><input className={inputCls} value={verifyForm.sku_code_scanned} onChange={(e) => setVerifyForm({ ...verifyForm, sku_code_scanned: e.target.value })} /></Field>
-          <Field label="Quantity scanned"><input className={inputCls} type="number" value={verifyForm.qty_scanned} onChange={(e) => setVerifyForm({ ...verifyForm, qty_scanned: e.target.value })} /></Field>
-          <button className={btnPrimary} type="submit">Log verification</button>
-        </form>
-      )}
-    </div>
-  );
-}
-
-function Inbound({ rest }) {
-  const [mode, setMode] = useState("single");
-  const [form, setForm] = useState({ sku_code: "", txn_type: "purchase", party_name: "", qty_picked: "", qty_packed: "", qty_put_away: "", destination_location: "" });
-  const [error, setError] = useState("");
-  const [success, setSuccess] = useState("");
-
-  const submit = async (e) => {
-    e.preventDefault();
-    if (!form.sku_code || !form.destination_location || !form.qty_put_away) {
-      setError("SKU code, destination location, and quantity put away are required.");
-      return;
-    }
-    setError(""); setSuccess("");
-    try {
-      await rest("inbound_transactions", {
-        method: "POST",
-        body: JSON.stringify({
-          sku_code: form.sku_code,
-          txn_type: form.txn_type,
-          party_name: form.party_name,
-          qty_picked: Number(form.qty_picked || form.qty_put_away),
-          qty_packed: Number(form.qty_packed || form.qty_put_away),
-          qty_put_away: Number(form.qty_put_away),
-          destination_location: form.destination_location,
-        }),
-      });
-      setSuccess(`Put away ${form.qty_put_away} of ${form.sku_code} at ${form.destination_location}. Stock updated.`);
-      setForm({ sku_code: "", txn_type: "purchase", party_name: "", qty_picked: "", qty_packed: "", qty_put_away: "", destination_location: "" });
-    } catch (err) {
-      setError(err.message.includes("foreign key") ? "That SKU isn't in the master list yet. Add it from the Dashboard tab first." : err.message);
-    }
-  };
-
-  const tabBtn = (id, label) => (
-    <button onClick={() => setMode(id)} className={`px-3 py-1.5 text-sm rounded-md font-medium ${mode === id ? "bg-blue-700 text-white" : "text-slate-600 hover:bg-slate-100"}`}>
-      {label}
-    </button>
-  );
-
-  return (
-    <div>
-      <h2 className="text-base font-semibold text-slate-900 mb-4">Log inbound receipt</h2>
-      <div className="flex gap-1 mb-4">
-        {tabBtn("single", "Single SKU")}
-        {tabBtn("bulk", "Bulk shipment")}
-      </div>
-      {mode === "bulk" && <BulkInboundReceive rest={rest} />}
-      {mode === "single" && (
-      <>
-      <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
-      <form onSubmit={submit} className={`${card} max-w-md`}>
-        <Field label="SKU code"><SkuSearchInput rest={rest} value={form.sku_code} onChange={(v) => setForm({ ...form, sku_code: v })} onSelect={(r) => setForm({ ...form, sku_code: r.sku_code })} /></Field>
-        <Field label="Transaction type">
-          <select className={inputCls} value={form.txn_type} onChange={(e) => setForm({ ...form, txn_type: e.target.value })}>
-            <option value="purchase">Purchase</option>
-            <option value="returns">Returns</option>
-            <option value="retrieval">Retrieval</option>
-          </select>
-        </Field>
-        <Field label="Customer / vendor name"><input className={inputCls} value={form.party_name} onChange={(e) => setForm({ ...form, party_name: e.target.value })} /></Field>
-        <div className="grid grid-cols-3 gap-3">
-          <Field label="Picked"><input className={inputCls} type="number" min="0" value={form.qty_picked} onChange={(e) => setForm({ ...form, qty_picked: e.target.value })} /></Field>
-          <Field label="Packed"><input className={inputCls} type="number" min="0" value={form.qty_packed} onChange={(e) => setForm({ ...form, qty_packed: e.target.value })} /></Field>
-          <Field label="Put away"><input className={inputCls} type="number" min="0" value={form.qty_put_away} onChange={(e) => setForm({ ...form, qty_put_away: e.target.value })} /></Field>
-        </div>
-        <Field label="Put-away location"><input className={inputCls} value={form.destination_location} onChange={(e) => setForm({ ...form, destination_location: e.target.value })} placeholder="e.g. A-12-03" /></Field>
-        <button className={btnPrimary} type="submit">Log inbound</button>
-      </form>
-      </>
       )}
     </div>
   );
