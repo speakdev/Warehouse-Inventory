@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { LogOut, Search, Plus, Package, ArrowDownToLine, ArrowUpFromLine, ClipboardList, LayoutDashboard, ScanLine, RefreshCw, AlertCircle, CheckCircle2, ListTree, UploadCloud, ClipboardCheck, ChevronLeft, ChevronRight, Trash2, Pencil } from "lucide-react";
+import { LogOut, Search, Plus, Package, ArrowDownToLine, ArrowUpFromLine, ClipboardList, LayoutDashboard, ScanLine, RefreshCw, AlertCircle, CheckCircle2, ListTree, UploadCloud, ClipboardCheck, ChevronLeft, ChevronRight, Trash2, Pencil, MapPin } from "lucide-react";
 import * as XLSX from "xlsx";
 
 const SUPABASE_URL = "https://zaakpcdkxdvpfribryvt.supabase.co";
@@ -1047,6 +1047,170 @@ function BulkUpload({ rest }) {
   );
 }
 
+function ManageLocations({ rest }) {
+  const [summary, setSummary] = useState(null);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+
+  const [fileName, setFileName] = useState("");
+  const [parsedCodes, setParsedCodes] = useState([]);
+  const [uploadProgress, setUploadProgress] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const [range, setRange] = useState({ prefix: "", start: "", end: "" });
+
+  const [filterText, setFilterText] = useState("");
+  const [previewRows, setPreviewRows] = useState(null);
+
+  const loadSummary = useCallback(async () => {
+    try {
+      const [active, inactive, empty] = await Promise.all([
+        rest("locations?select=location_code&is_active=eq.true&limit=20000"),
+        rest("locations?select=location_code&is_active=eq.false&limit=20000"),
+        rest("empty_locations?select=location_code&limit=20000"),
+      ]);
+      setSummary({ active: active?.length ?? 0, inactive: inactive?.length ?? 0, empty: empty?.length ?? 0 });
+    } catch { /* summary is a nice-to-have, ignore failures */ }
+  }, [rest]);
+
+  useEffect(() => { loadSummary(); }, [loadSummary]);
+
+  // Reads either a proper location_code column, OR — matching your rack
+  // sheet — a headerless grid where every non-blank cell is a location code.
+  const handleFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setError(""); setSuccess(""); setParsedCodes([]);
+    setFileName(file.name);
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array" });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const asObjects = XLSX.utils.sheet_to_json(sheet, { defval: null });
+      const headerKey = asObjects.length ? findColumn(asObjects[0], ["location_code", "location", "code"]) : null;
+      let codes = [];
+      if (headerKey) {
+        codes = asObjects.map((r) => String(r[headerKey] ?? "").trim()).filter(Boolean);
+      } else {
+        const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
+        raw.forEach((row) => row.forEach((cell) => { if (cell !== null && cell !== undefined && String(cell).trim()) codes.push(String(cell).trim()); }));
+      }
+      setParsedCodes([...new Set(codes)]);
+    } catch (err) {
+      setError("Couldn't read that file: " + err.message);
+    }
+  };
+
+  const uploadCodes = async (codes, doneMsg) => {
+    setBusy(true); setError(""); setSuccess("");
+    setUploadProgress({ done: 0, total: codes.length });
+    try {
+      const records = codes.map((location_code) => ({ location_code }));
+      const batchSize = 1000;
+      for (let i = 0; i < records.length; i += batchSize) {
+        const batch = records.slice(i, i + batchSize);
+        await rest("locations?on_conflict=location_code", { method: "POST", body: JSON.stringify(batch), prefer: "resolution=merge-duplicates,return=minimal" });
+        setUploadProgress({ done: Math.min(i + batchSize, records.length), total: records.length });
+      }
+      setSuccess(doneMsg(codes.length));
+      setParsedCodes([]); setFileName(""); setUploadProgress(null);
+      loadSummary();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const generateRangeCodes = () => {
+    const start = Number(range.start), end = Number(range.end);
+    if (!range.prefix || !start || !end || end < start) return [];
+    const codes = [];
+    for (let i = start; i <= end; i++) codes.push(`${range.prefix}${i}`);
+    return codes;
+  };
+
+  const previewFilter = async () => {
+    if (!filterText) { setError("Enter text to match against location codes first."); return; }
+    setError("");
+    try {
+      const rows = await rest(`locations?select=location_code,is_active&location_code=ilike.*${encodeURIComponent(filterText)}*&order=location_code&limit=500`);
+      setPreviewRows(rows || []);
+    } catch (err) { setError(err.message); }
+  };
+
+  const applyFilter = async (activeValue) => {
+    setError(""); setSuccess("");
+    try {
+      await rest(`locations?location_code=ilike.*${encodeURIComponent(filterText)}*`, { method: "PATCH", body: JSON.stringify({ is_active: activeValue }), prefer: "return=minimal" });
+      setSuccess(`${activeValue ? "Activated" : "Deactivated"} all locations matching "${filterText}".`);
+      setPreviewRows(null); setFilterText("");
+      loadSummary();
+    } catch (err) { setError(err.message); }
+  };
+
+  const generated = generateRangeCodes();
+
+  return (
+    <div>
+      <h2 className="text-base font-semibold text-slate-900 mb-4">Manage locations</h2>
+      <Banner error={error} success={success} onClear={() => { setError(""); setSuccess(""); }} />
+
+      {summary && (
+        <div className="grid grid-cols-3 gap-3 mb-5">
+          <div className={card}><div className="text-xs text-slate-500">Active locations</div><div className="text-xl font-semibold text-slate-900">{summary.active}</div></div>
+          <div className={card}><div className="text-xs text-slate-500">Inactive locations</div><div className="text-xl font-semibold text-slate-900">{summary.inactive}</div></div>
+          <div className={card}><div className="text-xs text-slate-500">Currently empty (assignable)</div><div className="text-xl font-semibold text-slate-900">{summary.empty}</div></div>
+        </div>
+      )}
+
+      <div className={`${card} mb-5`}>
+        <h3 className="text-sm font-semibold text-slate-900 mb-1">Upload your location list</h3>
+        <p className="text-xs text-slate-500 mb-3">Works with a proper spreadsheet (a "location_code" column) or a plain grid like your rack sheet — every non-blank cell is read as one location code. Safe to re-run any time; existing codes are left untouched.</p>
+        <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFile} className="text-sm mb-3" />
+        {parsedCodes.length > 0 && <div className="bg-slate-50 border border-slate-200 rounded-md px-3 py-2 text-sm mb-3">Found <strong>{parsedCodes.length}</strong> unique location codes in {fileName}.</div>}
+        {uploadProgress && (
+          <div className="mb-3">
+            <div className="w-full bg-slate-200 rounded-full h-2 mb-1"><div className="bg-blue-700 h-2 rounded-full transition-all" style={{ width: `${(uploadProgress.done / uploadProgress.total) * 100}%` }} /></div>
+            <div className="text-xs text-slate-500">{uploadProgress.done} / {uploadProgress.total}</div>
+          </div>
+        )}
+        <button disabled={parsedCodes.length === 0 || busy} onClick={() => uploadCodes(parsedCodes, (n) => `Added ${n} locations.`)} className={btnPrimary}>{busy ? "Uploading..." : `Add ${parsedCodes.length || ""} locations`}</button>
+      </div>
+
+      <div className={`${card} mb-5`}>
+        <h3 className="text-sm font-semibold text-slate-900 mb-1">Generate a range of box/pallet codes</h3>
+        <p className="text-xs text-slate-500 mb-3">For your supplier-box system (e.g. Aramex boxes 1–1000): enter a prefix and a number range instead of typing each one. These get reused automatically once fully picked, same as any other location.</p>
+        <div className="grid grid-cols-3 gap-3 mb-3">
+          <Field label="Prefix"><input className={inputCls} value={range.prefix} onChange={(e) => setRange({ ...range, prefix: e.target.value })} placeholder="e.g. ARX-B" /></Field>
+          <Field label="Start #"><input className={inputCls} type="number" value={range.start} onChange={(e) => setRange({ ...range, start: e.target.value })} placeholder="1" /></Field>
+          <Field label="End #"><input className={inputCls} type="number" value={range.end} onChange={(e) => setRange({ ...range, end: e.target.value })} placeholder="1000" /></Field>
+        </div>
+        {generated.length > 0 && <div className="bg-slate-50 border border-slate-200 rounded-md px-3 py-2 text-sm mb-3">Will create <strong>{generated.length}</strong> codes: {generated[0]} … {generated[generated.length - 1]}</div>}
+        <button disabled={generated.length === 0 || busy} onClick={() => uploadCodes(generated, (n) => `Created ${n} box locations (${range.prefix}${range.start}–${range.prefix}${range.end}).`)} className={btnPrimary}>{busy ? "Creating..." : `Create ${generated.length || ""} codes`}</button>
+      </div>
+
+      <div className={card}>
+        <h3 className="text-sm font-semibold text-slate-900 mb-1">Activate / deactivate by pattern</h3>
+        <p className="text-xs text-slate-500 mb-3">Use this for bins that exist but currently can't be used — e.g. your L4/L5 rack levels without ladder access. Deactivated locations are skipped by auto-assignment everywhere, but nothing is deleted.</p>
+        <Field label="Text to match in location code"><input className={inputCls} value={filterText} onChange={(e) => setFilterText(e.target.value)} placeholder="e.g. L4 or L5" /></Field>
+        <button onClick={previewFilter} className={`${btnSecondary} mb-3`}>Preview matches</button>
+        {previewRows && (
+          <div className="mb-3">
+            <div className="text-xs text-slate-600 mb-2">{previewRows.length} location(s) match "{filterText}"{previewRows.length > 0 ? ` — e.g. ${previewRows.slice(0, 6).map((r) => r.location_code).join(", ")}${previewRows.length > 6 ? "…" : ""}` : ""}</div>
+            {previewRows.length > 0 && (
+              <div className="flex gap-2">
+                <button onClick={() => applyFilter(false)} className="text-sm px-3 py-1.5 rounded-md bg-amber-600 text-white hover:bg-amber-700">Deactivate these {previewRows.length}</button>
+                <button onClick={() => applyFilter(true)} className="text-sm px-3 py-1.5 rounded-md bg-emerald-600 text-white hover:bg-emerald-700">Activate these {previewRows.length}</button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function TeamAdmin({ rest }) {
   const [rows, setRows] = useState([]);
   const [error, setError] = useState("");
@@ -1148,6 +1312,7 @@ export default function App() {
     { id: "ledger", label: "Ledger", icon: ListTree },
     { id: "summary", label: "Summary", icon: ClipboardCheck },
     ...(isPrivileged ? [{ id: "bulk", label: "Bulk upload", icon: UploadCloud }] : []),
+    ...(isPrivileged ? [{ id: "locations", label: "Locations", icon: MapPin }] : []),
     ...(isAdmin ? [{ id: "team", label: "Team", icon: ScanLine }] : []),
   ];
 
@@ -1181,6 +1346,7 @@ export default function App() {
         {page === "ledger" && <Ledger rest={rest} />}
         {page === "summary" && <Summary rest={rest} rpc={rpc} />}
         {page === "bulk" && isPrivileged && <BulkUpload rest={rest} />}
+        {page === "locations" && isPrivileged && <ManageLocations rest={rest} />}
         {page === "team" && isAdmin && <TeamAdmin rest={rest} />}
       </div>
     </div>
